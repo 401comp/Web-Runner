@@ -80,3 +80,5 @@ For each candidate domain the app:
 ## License
 
 MIT
+
+See `LICENSE` for the full text.
