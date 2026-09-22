@@ -90,6 +90,13 @@ ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 
+echo "==> Building self-contained app ZIP…"
+ZIP="$DIST/${APP_NAME}-1.0.0-macos.zip"
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+unzip -t "$ZIP" >/dev/null
+
 echo "==> Done."
 echo "   App: $APP"
 echo "   DMG: $DMG"
+echo "   ZIP: $ZIP"
