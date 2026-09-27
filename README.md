@@ -50,7 +50,7 @@ cd Web-Runner
 ./build.sh
 ```
 
-This compiles in release mode, assembles `dist/Web-Runner.app`, embeds the Swift concurrency back-deploy runtime, ad-hoc signs, and produces both `dist/Web-Runner.dmg` and the self-contained `dist/Web-Runner.zip`.
+This compiles in release mode, assembles `dist/Web-Runner.app`, embeds the Swift concurrency back-deploy runtime, ad-hoc signs, and produces both `dist/Web-Runner.dmg` and a self-contained, versioned macOS ZIP.
 
 On a machine with full Xcode installed you can build a universal binary:
 
@@ -64,7 +64,7 @@ The app uses Swift `async`/`await`, whose runtime (`libswift_Concurrency.dylib`)
 
 ## Installation
 
-Open `dist/Web-Runner.dmg` and drag the app to your Applications folder, or unzip `dist/Web-Runner.zip` and move the contained app to Applications.
+Open `dist/Web-Runner.dmg` and drag the app to your Applications folder, or unzip the versioned macOS ZIP and move the contained app to Applications.
 
 ## Usage
 

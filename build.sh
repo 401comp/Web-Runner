@@ -10,13 +10,14 @@
 set -euo pipefail
 
 APP_NAME="Web-Runner"
+APP_VERSION="1.0.1"
 BUNDLE_ID="com.saltz.webrunner"
 EXEC_NAME="WebRunner"            # binary name from Package.swift target
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 DMG="$DIST/$APP_NAME.dmg"
-ZIP="$DIST/$APP_NAME.zip"
+ZIP="$DIST/${APP_NAME}-${APP_VERSION}-macos.zip"
 
 # Back-deploy concurrency runtime shipped with the command line tools.
 BACKDEPLOY_DYLIB="/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx/libswift_Concurrency.dylib"
@@ -49,8 +50,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>            <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>     <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>      <string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key>         <string>1.0.1</string>
-    <key>CFBundleShortVersionString</key><string>1.0.1</string>
+    <key>CFBundleVersion</key>         <string>$APP_VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
     <key>CFBundleExecutable</key>      <string>$EXEC_NAME</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
