@@ -14,7 +14,9 @@ A macOS desktop app that discovers HTTP websites by keyword. Enter one or more s
 - **Tor support** -- route traffic through a local SOCKS5 proxy, auto-detecting Tor on ports 9050 (standalone) and 9150 (Tor Browser); `.onion` domains work when enabled
 - **Sortable, resizable columns** -- native `NSTableView`; click any header to sort, drag dividers to resize
 - **Ping diagnostics** -- reachability, resolved IP, and round-trip latency per result
+- **Page and response metadata** -- title, description, content type, server header, and redirect target from the existing HTTP response
 - **Clickable results** -- domains and snippets open in your browser; all text is selectable
+- **Fast repeat searches** -- successful probes and misses are kept in a separate, clearable 10-minute in-memory cache
 - **Export** -- save results to a text file at a location you choose
 - **Concurrent scanning** -- 25 parallel requests direct, throttled to 6 over Tor
 
@@ -23,10 +25,15 @@ A macOS desktop app that discovers HTTP websites by keyword. Enter one or more s
 | Column | Meaning |
 | --- | --- |
 | Domain | Clickable link to the site |
+| Title | Page title or Open Graph title |
+| Description | Page description, Open Graph description, or cleaned page-text fallback |
 | Status | UP or DOWN (ping reachability) |
 | HTTP | Status code with a short description |
 | Type | HTTP Only, Redirects, or HTTP+HTTPS |
 | HTTPS? | Shown in HTTP-Only mode; whether HTTPS exists |
+| Content Type | Response media type |
+| Server | Web server header, when exposed |
+| Redirect Target | `Location` header destination, when present |
 | Tag | Where the keyword matched (url, header, content) |
 | Snippet | Context around the match |
 | IP | Resolved IP address |
@@ -43,7 +50,7 @@ cd Web-Runner
 ./build.sh
 ```
 
-This compiles in release mode, assembles `dist/Web-Runner.app`, embeds the Swift concurrency back-deploy runtime, ad-hoc signs, and produces `dist/Web-Runner.dmg`.
+This compiles in release mode, assembles `dist/Web-Runner.app`, embeds the Swift concurrency back-deploy runtime, ad-hoc signs, and produces both `dist/Web-Runner.dmg` and the self-contained `dist/Web-Runner.zip`.
 
 On a machine with full Xcode installed you can build a universal binary:
 
@@ -57,14 +64,15 @@ The app uses Swift `async`/`await`, whose runtime (`libswift_Concurrency.dylib`)
 
 ## Installation
 
-Open `dist/Web-Runner.dmg` and drag the app to your Applications folder, or run it directly from the DMG.
+Open `dist/Web-Runner.dmg` and drag the app to your Applications folder, or unzip `dist/Web-Runner.zip` and move the contained app to Applications.
 
 ## Usage
 
 1. Type one or more keywords in the search bar (space-separated).
 2. Press Return or click **Search**.
 3. Click column headers to sort; toggle **HTTP-Only results** to filter.
-4. **Export Results** saves the current (filtered) view to a text file.
+4. **Clear Search Cache** forces subsequent searches to re-probe every domain; the cache otherwise expires after 10 minutes.
+5. **Export Results** saves the current (filtered) view to a text file with full result columns followed by a URL-only section.
 
 Help is available in-app under **Help > Web-Runner Help** (⌘?).
 
@@ -76,6 +84,10 @@ For each candidate domain the app:
 2. Searches the domain, response headers, and stripped page text for all keywords
 3. Checks whether HTTPS is available and pings the host, in parallel
 4. Reports the result only if every keyword matched
+
+Recent probe results—including non-resolving domains—are cached in memory for
+10 minutes. The cache is keyed by domain, search terms, and whether Tor is in
+use, and can be cleared from the sidebar at any time.
 
 ## License
 

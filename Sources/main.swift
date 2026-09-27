@@ -101,10 +101,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         COLUMNS
         -------
         • Domain    — clickable link to the site
+        • Title     — page title or Open Graph title
+        • Description — page description, Open Graph description, or page-text fallback
         • Status    — UP or DOWN (ping reachability)
         • HTTP      — HTTP status code with short description
         • Type      — HTTP Only, Redirects to HTTPS, or HTTP+HTTPS
         • HTTPS?    — appears in HTTP-Only mode; shows if HTTPS exists
+        • Content Type — response media type
+        • Server    — web server header, when exposed
+        • Redirect Target — Location header destination, when present
         • Tag       — where the keyword matched (url, header, content)
         • Snippet   — context around the match (clickable)
         • IP        — resolved IP address
@@ -115,6 +120,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         SIDEBAR
         -------
         • Stop / Clear All — control scanning
+        • Clear Search Cache — discard the recent (10-minute) probe cache
         • HTTP-Only results — filter to sites without HTTPS
         • Tor Proxy — route traffic through Tor (SOCKS5)
         • Export Results — save to a file you choose

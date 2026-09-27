@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build & package Web-Runner as a Catalina-compatible .app and .dmg.
+# Build & package Web-Runner as a Catalina-compatible .app, .dmg, and ZIP.
 #
 # IMPORTANT: this app uses Swift async/await, whose runtime
 # (libswift_Concurrency.dylib) ships only in macOS 12+. To run on the
@@ -16,6 +16,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/$APP_NAME.app"
 DMG="$DIST/$APP_NAME.dmg"
+ZIP="$DIST/$APP_NAME.zip"
 
 # Back-deploy concurrency runtime shipped with the command line tools.
 BACKDEPLOY_DYLIB="/Library/Developer/CommandLineTools/usr/lib/swift-5.5/macosx/libswift_Concurrency.dylib"
@@ -48,8 +49,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key>            <string>$APP_NAME</string>
     <key>CFBundleDisplayName</key>     <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>      <string>$BUNDLE_ID</string>
-    <key>CFBundleVersion</key>         <string>1.0</string>
-    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleVersion</key>         <string>1.0.1</string>
+    <key>CFBundleShortVersionString</key><string>1.0.1</string>
     <key>CFBundleExecutable</key>      <string>$EXEC_NAME</string>
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
@@ -90,6 +91,11 @@ ln -s /Applications "$STAGE/Applications"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
 
+echo "==> Building ZIP…"
+rm -f "$ZIP"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+
 echo "==> Done."
 echo "   App: $APP"
 echo "   DMG: $DMG"
+echo "   ZIP: $ZIP"

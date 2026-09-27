@@ -12,7 +12,7 @@ struct TagMatch {
     let snippet: String
 }
 
-struct SiteResult: Identifiable, Hashable {
+struct SiteResult: Identifiable, Hashable, Sendable {
     let id = UUID()
     let domain: String
     let httpStatusCode: Int
@@ -26,6 +26,11 @@ struct SiteResult: Identifiable, Hashable {
     let pingTTL: Int?
     let matchedTag: String?
     let matchedSnippet: String?
+    let pageTitle: String?
+    let pageDescription: String?
+    let contentType: String?
+    let server: String?
+    let redirectTarget: String?
 
     var isHTTPOnly: Bool {
         !redirectsToHTTPS && !httpsAvailable
@@ -33,6 +38,56 @@ struct SiteResult: Identifiable, Hashable {
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: SiteResult, rhs: SiteResult) -> Bool { lhs.id == rhs.id }
+}
+
+/// A cache key describes exactly what can affect a probe result.  Tor and
+/// direct connections stay separate so a cached direct result is never shown
+/// as though it had been checked through Tor.
+struct ProbeCacheKey: Hashable, Sendable {
+    let domain: String
+    let keywordSignature: String
+    let usesTor: Bool
+}
+
+enum ProbeCacheLookup: Sendable {
+    case hit(SiteResult?)
+    case miss
+}
+
+/// Keeps recent successes *and* misses.  Caching misses matters here: most
+/// generated domains do not resolve, and retrying those on every search is
+/// where a lot of the waiting time goes.
+actor ProbeCache {
+    private struct Entry: Sendable {
+        let result: SiteResult?
+        let expiresAt: Date
+    }
+
+    private var entries: [ProbeCacheKey: Entry] = [:]
+    private let lifetime: TimeInterval = 10 * 60
+
+    func lookup(_ key: ProbeCacheKey) -> ProbeCacheLookup {
+        guard let entry = entries[key] else { return .miss }
+        guard entry.expiresAt > Date() else {
+            entries[key] = nil
+            return .miss
+        }
+        return .hit(entry.result)
+    }
+
+    func store(_ result: SiteResult?, for key: ProbeCacheKey) {
+        entries[key] = Entry(result: result, expiresAt: Date().addingTimeInterval(lifetime))
+    }
+
+    func clear() {
+        entries.removeAll()
+    }
+
+    func count() -> Int {
+        let now = Date()
+        entries = entries.filter { $0.value.expiresAt > now }
+        return entries.count
+    }
 }
 
 extension URLSession {
@@ -154,11 +209,24 @@ final class HTTPScanner: @unchecked Sendable {
     }
 
     private static func extractTagContent(_ html: String, tag: String) -> String? {
-        guard let openEnd = html.range(of: "<\(tag)")?.upperBound,
+        guard let openEnd = html.range(of: "<\(tag)", options: .caseInsensitive)?.upperBound,
               let contentStart = html[openEnd...].range(of: ">")?.upperBound,
-              let closeStart = html[contentStart...].range(of: "</\(tag)")?.lowerBound else { return nil }
+              let closeStart = html[contentStart...].range(of: "</\(tag)", options: .caseInsensitive)?.lowerBound else { return nil }
         let content = String(html[contentStart..<closeStart])
         return content.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func cleanPageText(_ text: String, maximumLength: Int = 300) -> String? {
+        let cleaned = text
+            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
+            .replacingOccurrences(of: "&quot;", with: "\"", options: .caseInsensitive)
+            .replacingOccurrences(of: "&#39;", with: "'", options: .caseInsensitive)
+            .replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        return String(cleaned.prefix(maximumLength))
     }
 
     private static func extractMetaContent(_ html: String, name: String) -> String? {
@@ -345,9 +413,28 @@ final class HTTPScanner: @unchecked Sendable {
         }
         let httpTime = Date().timeIntervalSince(start)
 
+        let html = String(data: httpData, encoding: .utf8) ?? String(data: httpData, encoding: .isoLatin1) ?? ""
+        let pageTitle = Self.cleanPageText(
+            Self.extractTagContent(html, tag: "title")
+                ?? Self.extractMetaContent(html, property: "og:title")
+                ?? "",
+            maximumLength: 160
+        )
+        let pageDescription = Self.extractMetaContent(html, name: "description")
+            ?? Self.extractMetaContent(html, property: "og:description")
+            ?? Self.cleanPageText(Self.extractTagContent(html, tag: "body") ?? "")
+        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type")?
+            .split(separator: ";", maxSplits: 1)
+            .first
+            .map(String.init)
+        let server = httpResponse.value(forHTTPHeaderField: "Server")
+            .flatMap { Self.cleanPageText($0, maximumLength: 160) }
+        let redirectTarget = httpResponse.value(forHTTPHeaderField: "Location").map {
+            URL(string: $0, relativeTo: httpURL)?.absoluteURL.absoluteString ?? $0
+        }
+
         var tagMatch: TagMatch?
         if let keywords = searchKeywords, !keywords.isEmpty {
-            let html = String(data: httpData, encoding: .utf8) ?? String(data: httpData, encoding: .ascii) ?? ""
             var headers: [String: String] = [:]
             for (key, value) in httpResponse.allHeaderFields {
                 headers["\(key)"] = "\(value)"
@@ -383,7 +470,12 @@ final class HTTPScanner: @unchecked Sendable {
             pingLatencyMs: ping.latencyMs,
             pingTTL: ping.ttl,
             matchedTag: tagMatch?.tag,
-            matchedSnippet: tagMatch?.snippet
+            matchedSnippet: tagMatch?.snippet,
+            pageTitle: pageTitle,
+            pageDescription: pageDescription,
+            contentType: contentType,
+            server: server,
+            redirectTarget: redirectTarget
         )
     }
 

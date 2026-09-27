@@ -63,6 +63,7 @@ final class ScannerViewModel: ObservableObject {
     @Published var progress: Double = 0
     @Published var domainsChecked = 0
     @Published var totalDomains = 0
+    @Published var cachedProbeCount = 0
 
     @Published var searchQuery = ""
     @Published var showHTTPOnly = false
@@ -71,6 +72,7 @@ final class ScannerViewModel: ObservableObject {
     @Published var torChecked = false
 
     private let scanner = HTTPScanner()
+    private let probeCache = ProbeCache()
     private var currentTask: Task<Void, Never>?
 
     init() {
@@ -125,6 +127,7 @@ final class ScannerViewModel: ObservableObject {
         guard !isScanning else { return }
 
         isScanning = true
+        results.removeAll()
         progress = 0
         domainsChecked = 0
 
@@ -139,7 +142,19 @@ final class ScannerViewModel: ObservableObject {
             let torLabel = scannerRef.useTor ? " (via Tor)" : ""
             await MainActor.run { statusMessage = "Searching \(allDomains.count) domains for \"\(label)\"\(torLabel)..." }
 
-            await scanDomains(allDomains, scanner: scannerRef, searchKeywords: keywords)
+            let keywordSignature = keywords
+                .map { $0.lowercased() }
+                .sorted()
+                .joined(separator: "\u{1F}")
+            await scanDomains(
+                allDomains,
+                scanner: scannerRef,
+                searchKeywords: keywords,
+                keywordSignature: keywordSignature,
+                usesTor: scannerRef.useTor
+            )
+            let cacheCount = await probeCache.count()
+            await MainActor.run { cachedProbeCount = cacheCount }
 
             if !Task.isCancelled {
                 await MainActor.run {
@@ -150,8 +165,15 @@ final class ScannerViewModel: ObservableObject {
         }
     }
 
-    private func scanDomains(_ domains: [String], scanner scannerRef: HTTPScanner, searchKeywords: [String]? = nil) async {
+    private func scanDomains(
+        _ domains: [String],
+        scanner scannerRef: HTTPScanner,
+        searchKeywords: [String]? = nil,
+        keywordSignature: String,
+        usesTor: Bool
+    ) async {
         let maxConcurrent = useTor ? 6 : 25
+        let cache = probeCache
 
         await withTaskGroup(of: SiteResult?.self) { group in
             var iterator = domains.makeIterator()
@@ -161,7 +183,15 @@ final class ScannerViewModel: ObservableObject {
                     let kws = searchKeywords
                     group.addTask {
                         guard !Task.isCancelled else { return nil }
-                        return await scannerRef.checkDomain(domain, searchKeywords: kws)
+                        let key = ProbeCacheKey(domain: domain, keywordSignature: keywordSignature, usesTor: usesTor)
+                        switch await cache.lookup(key) {
+                        case .hit(let result):
+                            return result
+                        case .miss:
+                            let result = await scannerRef.checkDomain(domain, searchKeywords: kws)
+                            await cache.store(result, for: key)
+                            return result
+                        }
                     }
                 }
             }
@@ -183,7 +213,15 @@ final class ScannerViewModel: ObservableObject {
                     let kws = searchKeywords
                     group.addTask {
                         guard !Task.isCancelled else { return nil }
-                        return await scannerRef.checkDomain(domain, searchKeywords: kws)
+                        let key = ProbeCacheKey(domain: domain, keywordSignature: keywordSignature, usesTor: usesTor)
+                        switch await cache.lookup(key) {
+                        case .hit(let result):
+                            return result
+                        case .miss:
+                            let result = await scannerRef.checkDomain(domain, searchKeywords: kws)
+                            await cache.store(result, for: key)
+                            return result
+                        }
                     }
                 }
             }
@@ -264,6 +302,16 @@ final class ScannerViewModel: ObservableObject {
         statusMessage = "Results cleared"
     }
 
+    func clearSearchCache() {
+        Task {
+            await probeCache.clear()
+            await MainActor.run {
+                cachedProbeCount = 0
+                statusMessage = "Search cache cleared"
+            }
+        }
+    }
+
     func exportResults() {
         let panel = NSSavePanel()
         panel.title = "Export Results"
@@ -280,30 +328,45 @@ final class ScannerViewModel: ObservableObject {
         lines.append(String(repeating: "=", count: 100))
         lines.append("")
 
+        lines.append("FULL RESULTS")
+        lines.append("URL\tTitle\tDescription\tStatus\tHTTP\tType\tHTTPS?\tContent Type\tServer\tRedirect Target\tTag\tSnippet\tIP Address\tLatency")
         for result in resultsToSave {
-            var line = "http://\(result.domain)"
-            line += "  |  \(result.pingable ? "UP" : "DOWN")"
-            line += "  |  \(httpCodeLabel(result.httpStatusCode))"
-            if result.isHTTPOnly {
-                line += "  |  HTTP-ONLY"
-            } else if result.redirectsToHTTPS {
-                line += "  |  REDIRECTS-TO-HTTPS"
-            } else {
-                line += "  |  HTTP+HTTPS"
-            }
-            if let tag = result.matchedTag {
-                line += "  |  Tag: \(tag)"
-            }
-            if let snippet = result.matchedSnippet {
-                line += "  |  \"\(snippet)\""
-            }
-            if let ip = result.pingIP { line += "  |  IP: \(ip)" }
-            if let ms = result.pingLatencyMs { line += "  |  \(String(format: "%.0fms", ms))" }
-            lines.append(line)
+            let type = result.isHTTPOnly ? "HTTP Only" : result.redirectsToHTTPS ? "Redirects to HTTPS" : "HTTP+HTTPS"
+            let title = result.pageTitle ?? "-"
+            let description = result.pageDescription ?? "-"
+            let contentType = result.contentType ?? "-"
+            let server = result.server ?? "-"
+            let redirectTarget = result.redirectTarget ?? "-"
+            let tag = result.matchedTag ?? "-"
+            let snippet = result.matchedSnippet ?? "-"
+            let ipAddress = result.pingIP ?? "-"
+            let latency = result.pingLatencyMs.map { String(format: "%.0fms", $0) } ?? "-"
+            let fields: [String] = [
+                "http://\(result.domain)",
+                title,
+                description,
+                result.pingable ? "UP" : "DOWN",
+                httpCodeLabel(result.httpStatusCode),
+                type,
+                result.httpsAvailable ? "Yes" : "No",
+                contentType,
+                server,
+                redirectTarget,
+                tag,
+                snippet,
+                ipAddress,
+                latency,
+            ]
+            lines.append(fields.joined(separator: "\t"))
         }
 
         lines.append("")
         lines.append("Total: \(resultsToSave.count) sites")
+        lines.append("")
+        lines.append("URLS ONLY")
+        for result in resultsToSave {
+            lines.append("http://\(result.domain)")
+        }
 
         let content = lines.joined(separator: "\n")
         do {
@@ -443,6 +506,10 @@ class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource
             switch key {
             case "domain":
                 cmp = a.domain.localizedCaseInsensitiveCompare(b.domain) == .orderedAscending
+            case "title":
+                cmp = (a.pageTitle ?? "~").localizedCaseInsensitiveCompare(b.pageTitle ?? "~") == .orderedAscending
+            case "description":
+                cmp = (a.pageDescription ?? "~").localizedCaseInsensitiveCompare(b.pageDescription ?? "~") == .orderedAscending
             case "status":
                 cmp = (a.pingable ? 1 : 0) < (b.pingable ? 1 : 0)
             case "http":
@@ -454,6 +521,12 @@ class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource
                 cmp = typeRank(a) < typeRank(b)
             case "https":
                 cmp = (a.httpsAvailable ? 1 : 0) < (b.httpsAvailable ? 1 : 0)
+            case "contentType":
+                cmp = (a.contentType ?? "~").localizedCaseInsensitiveCompare(b.contentType ?? "~") == .orderedAscending
+            case "server":
+                cmp = (a.server ?? "~").localizedCaseInsensitiveCompare(b.server ?? "~") == .orderedAscending
+            case "redirect":
+                cmp = (a.redirectTarget ?? "~").localizedCaseInsensitiveCompare(b.redirectTarget ?? "~") == .orderedAscending
             case "tag":
                 cmp = (a.matchedTag ?? "~") < (b.matchedTag ?? "~")
             case "snippet":
@@ -487,6 +560,10 @@ class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource
             field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
             field.textColor = .linkColor
             return field
+        case "title":
+            return makeLabel(result.pageTitle ?? "-", color: result.pageTitle == nil ? .tertiaryLabelColor : .labelColor)
+        case "description":
+            return makeLabel(result.pageDescription ?? "-", font: .systemFont(ofSize: 11), color: result.pageDescription == nil ? .tertiaryLabelColor : .secondaryLabelColor)
         case "status":
             return makeLabel(result.pingable ? "UP" : "DOWN",
                              font: .monospacedSystemFont(ofSize: 11, weight: .bold),
@@ -505,6 +582,12 @@ class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource
             let text = result.httpsAvailable ? "Yes" : "No"
             let color: NSColor = result.httpsAvailable ? .systemGreen : .secondaryLabelColor
             return makeLabel(text, font: .systemFont(ofSize: 11, weight: .medium), color: color, alignment: .center)
+        case "contentType":
+            return makeLabel(result.contentType ?? "-", font: .monospacedSystemFont(ofSize: 11, weight: .regular), color: result.contentType == nil ? .tertiaryLabelColor : .labelColor)
+        case "server":
+            return makeLabel(result.server ?? "-", font: .monospacedSystemFont(ofSize: 11, weight: .regular), color: result.server == nil ? .tertiaryLabelColor : .labelColor)
+        case "redirect":
+            return makeLabel(result.redirectTarget ?? "-", font: .systemFont(ofSize: 11), color: result.redirectTarget == nil ? .tertiaryLabelColor : .secondaryLabelColor)
         case "tag":
             return makeLabel(result.matchedTag ?? "-",
                              color: result.matchedTag != nil ? .systemPurple : .tertiaryLabelColor,
@@ -616,9 +699,14 @@ struct ResultsTableView: NSViewRepresentable {
     private func addColumns(to tableView: NSTableView, showHTTPOnly: Bool) {
         let cols: [(id: String, title: String, width: CGFloat, min: CGFloat, max: CGFloat)] = [
             ("domain",  "Domain",     220, 120, 600),
+            ("title",   "Title",      180, 100, 500),
+            ("description", "Description", 280, 140, 800),
             ("status",  "Status",      46,  36,  80),
             ("http",    "HTTP",        90,  60, 150),
             ("type",    "Type",        80,  55, 140),
+            ("contentType", "Content Type", 120, 85, 260),
+            ("server", "Server",      120, 80, 280),
+            ("redirect", "Redirect Target", 220, 120, 600),
             ("tag",     "Tag",         70,  40, 140),
             ("snippet", "Snippet",    200, 100, 800),
             ("ip",      "IP Address", 115,  80, 180),
@@ -698,6 +786,19 @@ struct ContentView: View {
                 }
                 .disabled(vm.isScanning || vm.results.isEmpty)
 
+                Text("Search cache")
+                    .font(.headline)
+
+                Text("\(vm.cachedProbeCount) recent probes (10 min)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Button(action: vm.clearSearchCache) {
+                    Text("Clear Search Cache")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(vm.isScanning || vm.cachedProbeCount == 0)
+
                 Divider()
 
                 Text("Display")
@@ -774,7 +875,10 @@ struct ContentView: View {
                     .padding(.top, 4)
                 Spacer()
             } else {
-                ResultsTableView(results: vm.filteredResults, showHTTPOnly: vm.showHTTPOnly)
+                ResultsTableView(
+                    results: vm.filteredResults,
+                    showHTTPOnly: vm.showHTTPOnly
+                )
             }
         }
     }
@@ -796,7 +900,7 @@ struct ContentView: View {
             Spacer()
 
             if !vm.results.isEmpty {
-                Text("Results: \(vm.filteredResults.count)")
+                Text(vm.showHTTPOnly ? "Showing: \(vm.filteredResults.count) of \(vm.results.count)" : "Results: \(vm.results.count)")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 8)
