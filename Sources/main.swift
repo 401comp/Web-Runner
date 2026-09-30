@@ -122,17 +122,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         • Stop / Clear All — control scanning
         • Clear Search Cache — discard the recent (10-minute) probe cache
         • HTTP-Only results — filter to sites without HTTPS
-        • Tor Proxy — route traffic through Tor (SOCKS5)
+        • Tor Proxy — route ordinary scan requests through Tor (SOCKS5)
         • Export Results — save to a file you choose
 
-        TOR SUPPORT
-        -----------
-        Toggle "Use Tor" to route all requests through a local
-        Tor SOCKS5 proxy. The app auto-detects Tor on ports 9050
-        (standalone) and 9150 (Tor Browser). Click Connect to
-        launch tor if it's installed but not running.
-
-        .onion domains are supported when Tor is enabled.
+        TOR PROXY
+        ---------
+        Toggle "Use Tor" to route ordinary HTTP and HTTPS scan requests
+        through a local Tor SOCKS5 proxy. The app auto-detects ports 9050
+        (standalone) and 9150 (Tor Browser). This is a proxy setting only.
 
         KEYBOARD SHORTCUTS
         ------------------

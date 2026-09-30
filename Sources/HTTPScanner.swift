@@ -1,561 +1,41 @@
 import Foundation
 
-struct PingInfo {
-    let reachable: Bool
-    let ip: String?
-    let latencyMs: Double?
-    let ttl: Int?
+private extension Optional where Wrapped == String {
+    var orEmpty: String { self ?? "" }
 }
 
-struct TagMatch {
-    let tag: String
-    let snippet: String
-}
-
-struct SiteResult: Identifiable, Hashable, Sendable {
+struct SearchResult: Identifiable, Hashable, Sendable {
     let id = UUID()
-    let domain: String
-    let httpStatusCode: Int
+    let url: URL
+    let title: String
+    var source: String
+    let httpStatusCode: Int?
     let redirectsToHTTPS: Bool
-    let httpsAvailable: Bool
-    let responseTime: TimeInterval
-    let timestamp: Date
-    let pingable: Bool
-    let pingIP: String?
-    let pingLatencyMs: Double?
-    let pingTTL: Int?
-    let matchedTag: String?
-    let matchedSnippet: String?
-    let pageTitle: String?
-    let pageDescription: String?
-    let contentType: String?
-    let server: String?
-    let redirectTarget: String?
+    let httpsAvailable: Bool?
 
+    init(
+        url: URL,
+        title: String,
+        source: String,
+        httpStatusCode: Int? = nil,
+        redirectsToHTTPS: Bool = false,
+        httpsAvailable: Bool? = nil
+    ) {
+        self.url = url
+        self.title = title
+        self.source = source
+        self.httpStatusCode = httpStatusCode
+        self.redirectsToHTTPS = redirectsToHTTPS
+        self.httpsAvailable = httpsAvailable
+    }
+
+    /// A plain HTTP link from an index is not proof that HTTPS is unavailable.
     var isHTTPOnly: Bool {
-        !redirectsToHTTPS && !httpsAvailable
-    }
-
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
-    static func == (lhs: SiteResult, rhs: SiteResult) -> Bool { lhs.id == rhs.id }
-}
-
-/// A cache key describes exactly what can affect a probe result.  Tor and
-/// direct connections stay separate so a cached direct result is never shown
-/// as though it had been checked through Tor.
-struct ProbeCacheKey: Hashable, Sendable {
-    let domain: String
-    let keywordSignature: String
-    let usesTor: Bool
-}
-
-enum ProbeCacheLookup: Sendable {
-    case hit(SiteResult?)
-    case miss
-}
-
-/// Keeps recent successes *and* misses.  Caching misses matters here: most
-/// generated domains do not resolve, and retrying those on every search is
-/// where a lot of the waiting time goes.
-actor ProbeCache {
-    private struct Entry: Sendable {
-        let result: SiteResult?
-        let expiresAt: Date
-    }
-
-    private var entries: [ProbeCacheKey: Entry] = [:]
-    private let lifetime: TimeInterval = 10 * 60
-
-    func lookup(_ key: ProbeCacheKey) -> ProbeCacheLookup {
-        guard let entry = entries[key] else { return .miss }
-        guard entry.expiresAt > Date() else {
-            entries[key] = nil
-            return .miss
-        }
-        return .hit(entry.result)
-    }
-
-    func store(_ result: SiteResult?, for key: ProbeCacheKey) {
-        entries[key] = Entry(result: result, expiresAt: Date().addingTimeInterval(lifetime))
-    }
-
-    func clear() {
-        entries.removeAll()
-    }
-
-    func count() -> Int {
-        let now = Date()
-        entries = entries.filter { $0.value.expiresAt > now }
-        return entries.count
+        httpStatusCode != nil && !redirectsToHTTPS && httpsAvailable == false
     }
 }
 
-extension URLSession {
-    func asyncData(for request: URLRequest) async throws -> (Data, URLResponse) {
-        try await withCheckedThrowingContinuation { continuation in
-            let task = self.dataTask(with: request) { data, response, error in
-                if let error = error {
-                    continuation.resume(throwing: error)
-                } else if let data = data, let response = response {
-                    continuation.resume(returning: (data, response))
-                } else {
-                    continuation.resume(throwing: URLError(.unknown))
-                }
-            }
-            task.resume()
-        }
-    }
-
-    func asyncData(from url: URL) async throws -> (Data, URLResponse) {
-        try await asyncData(for: URLRequest(url: url))
-    }
-}
-
-final class HTTPScanner: @unchecked Sendable {
-    private let httpSession: URLSession
-    private let httpsSession: URLSession
-    private var torHttpSession: URLSession?
-    private var torHttpsSession: URLSession?
-    private let noRedirectDelegate = NoRedirectDelegate()
-    var useTor: Bool = false
-    private(set) var torPort: Int = 0
-
-    static let wordList: [String] = [
-        "ace", "air", "app", "art", "bay", "bee", "big", "bit", "box", "bug",
-        "bus", "buy", "car", "cat", "cup", "day", "dog", "dot", "dry", "duo",
-        "ear", "eat", "egg", "end", "era", "eye", "fan", "fig", "fin", "fit",
-        "fly", "fog", "fox", "fun", "gap", "gas", "gem", "gin", "god", "gym",
-        "hat", "hen", "hip", "hit", "hop", "hot", "hub", "ice", "ink", "ivy",
-        "jam", "jar", "jet", "job", "joy", "key", "kid", "kit", "lab", "law",
-        "leg", "lip", "log", "map", "max", "mix", "mod", "net", "new", "nut",
-        "oak", "oil", "old", "one", "orb", "ore", "out", "owl", "pad", "pal",
-        "pan", "pay", "pen", "pet", "pie", "pin", "pit", "pod", "pop", "pot",
-        "pro", "pub", "ram", "rap", "rat", "raw", "ray", "red", "rig", "rim",
-        "rod", "row", "rug", "rum", "run", "rye", "sea", "set", "ski", "sky",
-        "spa", "spy", "sub", "sum", "sun", "tab", "tag", "tan", "tap", "tax",
-        "tea", "ten", "tie", "tin", "tip", "toe", "ton", "top", "toy", "try",
-        "tub", "two", "van", "vet", "vim", "war", "wax", "way", "web", "wet",
-        "win", "wit", "wow", "yak", "zen", "zip", "zoo",
-        "ball", "band", "bank", "base", "best", "bike", "blog", "blue", "boat",
-        "bold", "bond", "book", "boss", "buzz", "cafe", "cake", "call", "calm",
-        "camp", "card", "care", "case", "cash", "chat", "chip", "city", "clip",
-        "club", "code", "coin", "cool", "copy", "core", "cost", "cube", "cure",
-        "dark", "data", "date", "dawn", "deal", "demo", "desk", "dock", "dome",
-        "door", "down", "drop", "drum", "duck", "dust", "earn", "ease", "east",
-        "easy", "echo", "edge", "edit", "face", "fact", "fair", "fame", "farm",
-        "fast", "fate", "fear", "feed", "file", "film", "find", "fine", "fire",
-        "firm", "fish", "flag", "flat", "flex", "flip", "flow", "fold", "folk",
-        "food", "form", "fort", "free", "fuel", "full", "fund", "fuse", "gain",
-        "game", "gate", "gear", "gene", "gift", "glad", "glow", "glue", "goat",
-        "gold", "golf", "good", "grab", "grid", "grip", "grow", "gulf", "guru",
-        "hack", "hair", "half", "hall", "hand", "hard", "haze", "head", "heal",
-        "heat", "help", "hero", "hide", "high", "hike", "hill", "hint", "hire",
-        "hold", "hole", "home", "hook", "hope", "host", "huge", "hunt", "hype",
-        "icon", "idea", "info", "iron", "isle", "item", "jade", "jazz", "jobs",
-        "join", "joke", "jump", "keen", "keep", "kick", "kind", "king", "kite",
-        "know", "lack", "lake", "lamp", "land", "lane", "last", "late", "lawn",
-        "lead", "leaf", "lean", "left", "lens", "life", "lift", "like", "lime",
-        "line", "link", "lion", "list", "live", "load", "loan", "lock", "logo",
-        "long", "look", "loop", "love", "luck", "lure", "mail", "main", "make",
-        "mark", "mask", "maze", "meal", "menu", "mesh", "mile", "milk", "mind",
-        "mine", "mint", "mist", "mode", "mood", "moon", "more", "moss", "move",
-        "muse", "myth", "nail", "name", "navy", "neat", "neck", "need", "nest",
-        "news", "next", "nice", "nine", "node", "noon", "nose", "note", "nova",
-        "open", "pack", "page", "park", "path", "peak", "pick", "pine", "pipe",
-        "plan", "play", "plot", "plug", "poem", "pole", "pool", "port", "post",
-        "pull", "pump", "pure", "push", "race", "rack", "rage", "rail", "rain",
-        "rank", "rare", "rate", "read", "real", "reef", "rent", "rest", "rich",
-        "ride", "ring", "rise", "risk", "road", "rock", "role", "roll", "roof",
-        "room", "root", "rope", "rose", "rule", "rush", "safe", "sail", "sale",
-        "salt", "sand", "save", "scan", "seal", "seat", "seed", "seek", "self",
-        "sell", "send", "ship", "shop", "show", "side", "sign", "silk", "sing",
-        "sink", "site", "size", "skin", "skip", "slim", "slip", "slot", "slow",
-        "snap", "snow", "soap", "soft", "soil", "sole", "song", "sort", "soul",
-        "spin", "spot", "star", "stay", "stem", "step", "stop", "surf", "swap",
-        "sync", "tail", "tale", "talk", "tank", "tape", "task", "team", "tech",
-        "term", "test", "text", "tide", "tile", "time", "tiny", "tire", "tone",
-        "tool", "tour", "town", "trap", "tree", "trim", "trip", "true", "tube",
-        "tune", "turn", "type", "unit", "user", "vast", "vice", "view", "vine",
-        "void", "volt", "vote", "wage", "wait", "wake", "walk", "wall", "want",
-        "warm", "warn", "wash", "wave", "weak", "wear", "week", "well", "west",
-        "wide", "wiki", "wild", "will", "wind", "wine", "wing", "wire", "wise",
-        "wish", "wolf", "wood", "word", "work", "yard", "year", "yoga", "zero",
-        "zone", "zoom"
-    ]
-
-    static func searchEverywhere(domain: String, html: String, headers: [String: String], keywords: [String]) -> TagMatch? {
-        let lowerKws = keywords.map { $0.lowercased() }
-
-        let domainLower = domain.lowercased()
-        if lowerKws.allSatisfy({ domainLower.contains($0) }) {
-            return TagMatch(tag: "url", snippet: domain)
-        }
-
-        let headerText = headers.map { "\($0.key): \($0.value)" }.joined(separator: " ").lowercased()
-        if !headerText.isEmpty, lowerKws.allSatisfy({ headerText.contains($0) }) {
-            return TagMatch(tag: "header", snippet: cleanSnippet(headerText, around: lowerKws[0]))
-        }
-
-        let stripped = html.lowercased()
-            .replacingOccurrences(of: "<script[^>]*>[\\s\\S]*?</script>", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-
-        if lowerKws.allSatisfy({ stripped.contains($0) }) {
-            return TagMatch(tag: "content", snippet: cleanSnippet(stripped, around: lowerKws[0]))
-        }
-
-        return nil
-    }
-
-    private static func extractTagContent(_ html: String, tag: String) -> String? {
-        guard let openEnd = html.range(of: "<\(tag)", options: .caseInsensitive)?.upperBound,
-              let contentStart = html[openEnd...].range(of: ">")?.upperBound,
-              let closeStart = html[contentStart...].range(of: "</\(tag)", options: .caseInsensitive)?.lowerBound else { return nil }
-        let content = String(html[contentStart..<closeStart])
-        return content.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func cleanPageText(_ text: String, maximumLength: Int = 300) -> String? {
-        let cleaned = text
-            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-            .replacingOccurrences(of: "&nbsp;", with: " ", options: .caseInsensitive)
-            .replacingOccurrences(of: "&quot;", with: "\"", options: .caseInsensitive)
-            .replacingOccurrences(of: "&#39;", with: "'", options: .caseInsensitive)
-            .replacingOccurrences(of: "&amp;", with: "&", options: .caseInsensitive)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else { return nil }
-        return String(cleaned.prefix(maximumLength))
-    }
-
-    private static func extractMetaContent(_ html: String, name: String) -> String? {
-        let patterns = [
-            "<meta[^>]*name=\"\(name)\"[^>]*content=\"([^\"]*)\"",
-            "<meta[^>]*content=\"([^\"]*)\"[^>]*name=\"\(name)\""
-        ]
-        return matchMetaPatterns(html, patterns: patterns)
-    }
-
-    private static func extractMetaContent(_ html: String, property: String) -> String? {
-        let patterns = [
-            "<meta[^>]*property=\"\(property)\"[^>]*content=\"([^\"]*)\"",
-            "<meta[^>]*content=\"([^\"]*)\"[^>]*property=\"\(property)\""
-        ]
-        return matchMetaPatterns(html, patterns: patterns)
-    }
-
-    private static func matchMetaPatterns(_ html: String, patterns: [String]) -> String? {
-        for pattern in patterns {
-            if let range = html.range(of: pattern, options: .regularExpression) {
-                let match = String(html[range])
-                if let cStart = match.range(of: "content=\"")?.upperBound,
-                   let cEnd = match[cStart...].firstIndex(of: "\"") {
-                    return String(match[cStart..<cEnd])
-                }
-            }
-        }
-        return nil
-    }
-
-    private static func cleanSnippet(_ text: String, around keyword: String) -> String {
-        let collapsed = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let kwRange = collapsed.range(of: keyword, options: .caseInsensitive) else {
-            return String(collapsed.prefix(80))
-        }
-        let center = collapsed.distance(from: collapsed.startIndex, to: kwRange.lowerBound)
-        let snippetStart = max(0, center - 30)
-        let startIdx = collapsed.index(collapsed.startIndex, offsetBy: snippetStart)
-        let endIdx = collapsed.index(startIdx, offsetBy: min(80, collapsed.distance(from: startIdx, to: collapsed.endIndex)))
-        var snippet = String(collapsed[startIdx..<endIdx])
-        if snippetStart > 0 { snippet = "..." + snippet }
-        if endIdx < collapsed.endIndex { snippet += "..." }
-        return snippet
-    }
-
-    init() {
-        let httpCfg = URLSessionConfiguration.ephemeral
-        httpCfg.timeoutIntervalForRequest = 3
-        httpCfg.timeoutIntervalForResource = 5
-        httpCfg.waitsForConnectivity = false
-        self.httpSession = URLSession(configuration: httpCfg, delegate: noRedirectDelegate, delegateQueue: nil)
-
-        let httpsCfg = URLSessionConfiguration.ephemeral
-        httpsCfg.timeoutIntervalForRequest = 3
-        httpsCfg.timeoutIntervalForResource = 5
-        httpsCfg.waitsForConnectivity = false
-        self.httpsSession = URLSession(configuration: httpsCfg)
-
-    }
-
-    private func buildTorSessions(port: Int) {
-        let torProxy: [AnyHashable: Any] = [
-            kCFNetworkProxiesSOCKSEnable as String: true,
-            kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
-            kCFNetworkProxiesSOCKSPort as String: port,
-        ]
-
-        let torHttpCfg = URLSessionConfiguration.ephemeral
-        torHttpCfg.timeoutIntervalForRequest = 20
-        torHttpCfg.timeoutIntervalForResource = 40
-        torHttpCfg.waitsForConnectivity = false
-        torHttpCfg.connectionProxyDictionary = torProxy
-        torHttpCfg.httpMaximumConnectionsPerHost = 2
-        self.torHttpSession = URLSession(configuration: torHttpCfg, delegate: noRedirectDelegate, delegateQueue: nil)
-
-        let torHttpsCfg = URLSessionConfiguration.ephemeral
-        torHttpsCfg.timeoutIntervalForRequest = 20
-        torHttpsCfg.timeoutIntervalForResource = 40
-        torHttpsCfg.waitsForConnectivity = false
-        torHttpsCfg.connectionProxyDictionary = torProxy
-        torHttpsCfg.httpMaximumConnectionsPerHost = 2
-        self.torHttpsSession = URLSession(configuration: torHttpsCfg)
-
-        self.torPort = port
-    }
-
-    private var activeHttpSession: URLSession { useTor ? (torHttpSession ?? httpSession) : httpSession }
-    private var activeHttpsSession: URLSession { useTor ? (torHttpsSession ?? httpsSession) : httpsSession }
-
-    func checkTorConnection() async -> (Bool, Int) {
-        for port in [9050, 9150] {
-            buildTorSessions(port: port)
-            guard let url = URL(string: "http://check.torproject.org") else { continue }
-            do {
-                let (data, _) = try await torHttpSession!.asyncData(from: url)
-                let body = String(data: data, encoding: .utf8) ?? ""
-                if body.contains("Congratulations") || body.contains("configured to use Tor") {
-                    return (true, port)
-                }
-            } catch {
-                continue
-            }
-        }
-        torHttpSession = nil
-        torHttpsSession = nil
-        torPort = 0
-        return (false, 0)
-    }
-
-    static let searchPrefixes = [
-        "my", "the", "go", "get", "best", "top", "pro", "all", "new", "try",
-        "free", "cool", "real", "web", "i", "e", "a", "big", "hot", "use"
-    ]
-
-    static let searchSuffixes = [
-        "hub", "app", "dev", "web", "hq", "now", "box", "zone", "spot", "base",
-        "site", "net", "pro", "lab", "world", "city", "bay", "go", "ly", "ify"
-    ]
-
-    func searchDomains(keywords: [String], tlds: [String]) -> [String] {
-        guard !tlds.isEmpty, !keywords.isEmpty else { return [] }
-
-        var domains: [String] = []
-        var seen = Set<String>()
-
-        for keyword in keywords {
-            let sanitized = keyword.lowercased()
-                .filter { $0.isLetter || $0.isNumber || $0 == "-" }
-            guard !sanitized.isEmpty else { continue }
-
-            for tld in tlds {
-                let exact = "\(sanitized).\(tld)"
-                if seen.insert(exact).inserted { domains.append(exact) }
-
-                for prefix in Self.searchPrefixes {
-                    let d = "\(prefix)\(sanitized).\(tld)"
-                    if seen.insert(d).inserted { domains.append(d) }
-                }
-
-                for suffix in Self.searchSuffixes {
-                    let d = "\(sanitized)\(suffix).\(tld)"
-                    if seen.insert(d).inserted { domains.append(d) }
-                }
-            }
-        }
-
-        return domains
-    }
-
-    func generateRandomDomains(tlds: [String], count: Int) -> [String] {
-        guard !tlds.isEmpty else { return [] }
-        var domains: [String] = []
-        var seen = Set<String>()
-        let maxAttempts = count * 3
-        var attempts = 0
-        while domains.count < count && attempts < maxAttempts {
-            attempts += 1
-            let word = Self.wordList.randomElement()!
-            let tld = tlds.randomElement()!
-            let domain = "\(word).\(tld)"
-            if seen.insert(domain).inserted {
-                domains.append(domain)
-            }
-        }
-        return domains
-    }
-
-    func checkDomain(_ domain: String, searchKeywords: [String]? = nil) async -> SiteResult? {
-        guard let httpURL = URL(string: "http://\(domain)") else { return nil }
-
-        let isOnion = domain.hasSuffix(".onion")
-        let start = Date()
-        let httpResponse: HTTPURLResponse
-        let httpData: Data
-        do {
-            let request = URLRequest(url: httpURL)
-            let (data, response) = try await activeHttpSession.asyncData(for: request)
-            guard let resp = response as? HTTPURLResponse else { return nil }
-            httpResponse = resp
-            httpData = data
-        } catch {
-            return nil
-        }
-        let httpTime = Date().timeIntervalSince(start)
-
-        let html = String(data: httpData, encoding: .utf8) ?? String(data: httpData, encoding: .isoLatin1) ?? ""
-        let pageTitle = Self.cleanPageText(
-            Self.extractTagContent(html, tag: "title")
-                ?? Self.extractMetaContent(html, property: "og:title")
-                ?? "",
-            maximumLength: 160
-        )
-        let pageDescription = Self.extractMetaContent(html, name: "description")
-            ?? Self.extractMetaContent(html, property: "og:description")
-            ?? Self.cleanPageText(Self.extractTagContent(html, tag: "body") ?? "")
-        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type")?
-            .split(separator: ";", maxSplits: 1)
-            .first
-            .map(String.init)
-        let server = httpResponse.value(forHTTPHeaderField: "Server")
-            .flatMap { Self.cleanPageText($0, maximumLength: 160) }
-        let redirectTarget = httpResponse.value(forHTTPHeaderField: "Location").map {
-            URL(string: $0, relativeTo: httpURL)?.absoluteURL.absoluteString ?? $0
-        }
-
-        var tagMatch: TagMatch?
-        if let keywords = searchKeywords, !keywords.isEmpty {
-            var headers: [String: String] = [:]
-            for (key, value) in httpResponse.allHeaderFields {
-                headers["\(key)"] = "\(value)"
-            }
-            tagMatch = Self.searchEverywhere(domain: domain, html: html, headers: headers, keywords: keywords)
-            if tagMatch == nil { return nil }
-        }
-
-        let redirectsToHTTPS: Bool
-        if let location = httpResponse.value(forHTTPHeaderField: "Location") {
-            redirectsToHTTPS = location.lowercased().hasPrefix("https://")
-        } else {
-            redirectsToHTTPS = false
-        }
-
-        async let httpsResult = checkHTTPS(domain: domain)
-        async let pingResult: PingInfo = isOnion
-            ? PingInfo(reachable: false, ip: nil, latencyMs: nil, ttl: nil)
-            : pingDomain(domain)
-
-        let httpsAvailable = await httpsResult
-        let ping = await pingResult
-
-        return SiteResult(
-            domain: domain,
-            httpStatusCode: httpResponse.statusCode,
-            redirectsToHTTPS: redirectsToHTTPS,
-            httpsAvailable: httpsAvailable,
-            responseTime: httpTime,
-            timestamp: Date(),
-            pingable: ping.reachable,
-            pingIP: ping.ip,
-            pingLatencyMs: ping.latencyMs,
-            pingTTL: ping.ttl,
-            matchedTag: tagMatch?.tag,
-            matchedSnippet: tagMatch?.snippet,
-            pageTitle: pageTitle,
-            pageDescription: pageDescription,
-            contentType: contentType,
-            server: server,
-            redirectTarget: redirectTarget
-        )
-    }
-
-    private func checkHTTPS(domain: String) async -> Bool {
-        guard let url = URL(string: "https://\(domain)") else { return false }
-        do {
-            let (_, response) = try await activeHttpsSession.asyncData(from: url)
-            if let http = response as? HTTPURLResponse {
-                return http.statusCode < 400
-            }
-            return false
-        } catch {
-            return false
-        }
-    }
-
-    func pingDomain(_ domain: String) async -> PingInfo {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/sbin/ping")
-            process.arguments = ["-c", "1", "-W", "2000", domain]
-
-            let outPipe = Pipe()
-            process.standardOutput = outPipe
-            process.standardError = Pipe()
-
-            process.terminationHandler = { proc in
-                let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-
-                if proc.terminationStatus == 0 {
-                    continuation.resume(returning: Self.parsePingOutput(output))
-                } else {
-                    let ip = Self.parseIP(from: output)
-                    continuation.resume(returning: PingInfo(reachable: false, ip: ip, latencyMs: nil, ttl: nil))
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: PingInfo(reachable: false, ip: nil, latencyMs: nil, ttl: nil))
-            }
-        }
-    }
-
-    private static func parsePingOutput(_ output: String) -> PingInfo {
-        let ip = parseIP(from: output)
-
-        var latencyMs: Double?
-        var ttl: Int?
-
-        if let range = output.range(of: "ttl=(\\d+)", options: .regularExpression) {
-            let str = String(output[range]).replacingOccurrences(of: "ttl=", with: "")
-            ttl = Int(str)
-        }
-
-        if let range = output.range(of: "time=([\\d.]+)", options: .regularExpression) {
-            let str = String(output[range]).replacingOccurrences(of: "time=", with: "")
-            latencyMs = Double(str)
-        }
-
-        return PingInfo(reachable: true, ip: ip, latencyMs: latencyMs, ttl: ttl)
-    }
-
-    private static func parseIP(from output: String) -> String? {
-        guard let openParen = output.firstIndex(of: "("),
-              let closeParen = output[output.index(after: openParen)...].firstIndex(of: ")"),
-              openParen < closeParen else { return nil }
-
-        let candidate = String(output[output.index(after: openParen)..<closeParen])
-        let parts = candidate.split(separator: ".")
-        if parts.count == 4, parts.allSatisfy({ Int($0) != nil }) {
-            return candidate
-        }
-        return nil
-    }
-}
-
-final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(
         _ session: URLSession,
         task: URLSessionTask,
@@ -564,5 +44,709 @@ final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sen
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         completionHandler(nil)
+    }
+}
+
+struct ImageResult: Identifiable, Hashable, Sendable {
+    let id = UUID()
+    let thumbnailURL: URL
+    let imageURL: URL
+    let pageURL: URL
+    let title: String
+}
+
+private enum SearchCacheKind: Hashable {
+    case surfaceWeb
+    case verifiedHTTPOnly
+    case surfaceImages
+}
+
+private struct SearchCacheKey: Hashable {
+    let query: String
+    let kind: SearchCacheKind
+}
+
+private struct CachedWebResults {
+    let createdAt: Date
+    let results: [SearchResult]
+}
+
+private struct CachedImageResults {
+    let createdAt: Date
+    let results: [ImageResult]
+}
+
+private final class SearchResultCache: @unchecked Sendable {
+    private let lifetime: TimeInterval = 10 * 60
+    private let lock = NSLock()
+    private var webResults: [SearchCacheKey: CachedWebResults] = [:]
+    private var imageResults: [SearchCacheKey: CachedImageResults] = [:]
+
+    func cachedWebResults(for key: SearchCacheKey) -> [SearchResult]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = webResults[key] else { return nil }
+        guard Date().timeIntervalSince(entry.createdAt) < lifetime else {
+            webResults[key] = nil
+            return nil
+        }
+        return entry.results
+    }
+
+    func cachedImageResults(for key: SearchCacheKey) -> [ImageResult]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = imageResults[key] else { return nil }
+        guard Date().timeIntervalSince(entry.createdAt) < lifetime else {
+            imageResults[key] = nil
+            return nil
+        }
+        return entry.results
+    }
+
+    func store(webResults results: [SearchResult], for key: SearchCacheKey) {
+        lock.lock()
+        webResults[key] = CachedWebResults(createdAt: Date(), results: results)
+        lock.unlock()
+    }
+
+    func store(imageResults results: [ImageResult], for key: SearchCacheKey) {
+        lock.lock()
+        imageResults[key] = CachedImageResults(createdAt: Date(), results: results)
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        webResults.removeAll()
+        imageResults.removeAll()
+        lock.unlock()
+    }
+
+    func summary() -> (entries: Int, results: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let cutoff = Date().addingTimeInterval(-lifetime)
+        webResults = webResults.filter { $0.value.createdAt >= cutoff }
+        imageResults = imageResults.filter { $0.value.createdAt >= cutoff }
+        let resultCount = webResults.values.reduce(0) { $0 + $1.results.count }
+            + imageResults.values.reduce(0) { $0 + $1.results.count }
+        return (webResults.count + imageResults.count, resultCount)
+    }
+}
+
+extension URLSession {
+    func asyncData(for request: URLRequest) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            let task = dataTask(with: request) { data, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if let data, let response {
+                    continuation.resume(returning: (data, response))
+                } else {
+                    continuation.resume(throwing: URLError(.unknown))
+                }
+            }
+            task.resume()
+        }
+    }
+}
+
+final class HTTPScanner: @unchecked Sendable {
+    private static let bingWebSearchURL = "https://www.bing.com/search"
+    private static let duckDuckGoWebSearchURL = "https://html.duckduckgo.com/html/"
+    private static let braveWebSearchURL = "https://search.brave.com/search"
+    private static let bingImageSearchURL = "https://www.bing.com/images/search"
+    private static let linkPattern = try! NSRegularExpression(
+        pattern: "(?i)<a\\b[^>]*href\\s*=\\s*[\\\"']([^\\\"']+)[\\\"']",
+        options: []
+    )
+    private static let braveResultPatterns = [
+        try! NSRegularExpression(
+            pattern: "(?is)<a\\s+href=\\\"(https?://[^\\\"]+)\\\"[^>]*class=\\\"[^\\\"]*(?:l1|title)[^\\\"]*\\\"",
+            options: []
+        ),
+        try! NSRegularExpression(
+            pattern: "(?is)<a\\s+class=\\\"[^\\\"]*(?:l1|title)[^\\\"]*\\\"[^>]*href=\\\"(https?://[^\\\"]+)\\\"",
+            options: []
+        )
+    ]
+    private static let bingResultPattern = try! NSRegularExpression(
+        pattern: "(?is)<li\\b[^>]*\\bclass\\s*=\\s*[\\\"'][^\\\"']*\\bb_algo\\b[^\\\"']*[\\\"'][^>]*>.*?<h2\\b[^>]*>\\s*<a\\b[^>]*href\\s*=\\s*[\\\"']([^\\\"']+)[\\\"']",
+        options: []
+    )
+    private static let duckDuckGoResultPattern = try! NSRegularExpression(
+        pattern: "(?is)<a\\b[^>]*\\bclass\\s*=\\s*[\\\"'][^\\\"']*\\bresult__a\\b[^\\\"']*[\\\"'][^>]*href\\s*=\\s*[\\\"']([^\\\"']+)[\\\"']|<a\\b[^>]*href\\s*=\\s*[\\\"']([^\\\"']+)[\\\"'][^>]*\\bclass\\s*=\\s*[\\\"'][^\\\"']*\\bresult__a\\b[^\\\"']*[\\\"']",
+        options: []
+    )
+    private static let imageMetadataPattern = try! NSRegularExpression(
+        pattern: "(?is)\\bm\\s*=\\s*[\\\"'](\\{.*?\\})[\\\"']",
+        options: []
+    )
+    private static let maxSearchResults = 1500
+    private static let webResultsPerPage = 10
+    private static let imageResultsPerPage = 35
+    private static let maxSurfaceResultsPerSource = maxSearchResults / 3
+    private static let maxSurfaceIndexPages = (maxSurfaceResultsPerSource + webResultsPerPage - 1) / webResultsPerPage
+    private static let maxSurfaceImagePages = (maxSearchResults + imageResultsPerPage - 1) / imageResultsPerPage
+    private static let httpVerificationConcurrency = 24
+    private static let httpVerificationTLDs = [
+        "com", "net", "org", "info", "biz", "io", "xyz", "site", "us", "co",
+        "fun", "online", "live", "tech", "dev", "app", "me", "tv", "cc", "in",
+        "de", "uk", "ru", "cn", "jp", "fr", "au", "ca", "br", "nl",
+        "eu", "ch", "se", "no", "fi", "dk", "pl", "cz", "at", "be",
+        "club", "shop", "store", "blog", "page", "space", "top", "pro", "mobi",
+        "name", "mx", "ar", "za", "kr", "tw", "sg", "hk", "nz", "il"
+    ]
+    private static let httpDiscoveryPrefixes = [
+        "my", "the", "go", "get", "best", "top", "pro", "all", "new", "try",
+        "free", "cool", "real", "web", "big", "hot", "use"
+    ]
+    private static let httpDiscoverySuffixes = [
+        "hub", "app", "dev", "web", "hq", "now", "box", "zone", "spot", "base",
+        "site", "net", "pro", "lab", "world", "city", "bay", "go", "ly", "ify"
+    ]
+
+    private let directSession: URLSession
+    private let noRedirectDelegate = NoRedirectDelegate()
+    private let noRedirectSession: URLSession
+    private let searchCache = SearchResultCache()
+    private var torSession: URLSession?
+    private(set) var torPort = 0
+    var useTor = false
+
+    init() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 25
+        configuration.waitsForConnectivity = false
+        directSession = URLSession(configuration: configuration)
+
+        let verificationConfiguration = URLSessionConfiguration.ephemeral
+        verificationConfiguration.timeoutIntervalForRequest = 3
+        verificationConfiguration.timeoutIntervalForResource = 5
+        verificationConfiguration.waitsForConnectivity = false
+        noRedirectSession = URLSession(
+            configuration: verificationConfiguration,
+            delegate: noRedirectDelegate,
+            delegateQueue: nil
+        )
+    }
+
+    private var activeSession: URLSession { useTor ? (torSession ?? directSession) : directSession }
+
+    private func buildTorSession(port: Int) {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 30
+        configuration.waitsForConnectivity = false
+        configuration.connectionProxyDictionary = [
+            kCFNetworkProxiesSOCKSEnable as String: true,
+            kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+            kCFNetworkProxiesSOCKSPort as String: port
+        ]
+        torSession = URLSession(configuration: configuration)
+        torPort = port
+    }
+
+    func checkTorConnection() async -> (Bool, Int) {
+        for port in [9050, 9150] {
+            buildTorSession(port: port)
+            guard let url = URL(string: "https://check.torproject.org") else { continue }
+            do {
+                let (data, _) = try await torSession!.asyncData(for: URLRequest(url: url))
+                let body = String(data: data, encoding: .utf8) ?? ""
+                if body.contains("Congratulations") || body.contains("configured to use Tor") {
+                    return (true, port)
+                }
+            } catch {
+                continue
+            }
+        }
+        torSession = nil
+        torPort = 0
+        return (false, 0)
+    }
+
+    func searchSurfaceWeb(query: String) async throws -> [SearchResult] {
+        let cacheKey = SearchCacheKey(query: normalizedQuery(query), kind: .surfaceWeb)
+        if let cached = searchCache.cachedWebResults(for: cacheKey) { return cached }
+        let sources: [(name: String, endpoint: String, queryItems: [URLQueryItem])] = [
+            ("Bing", Self.bingWebSearchURL, [URLQueryItem(name: "q", value: query)]),
+            ("Brave", Self.braveWebSearchURL, [
+                URLQueryItem(name: "q", value: query),
+                URLQueryItem(name: "offset", value: "0")
+            ]),
+            ("DuckDuckGo", Self.duckDuckGoWebSearchURL, [
+                URLQueryItem(name: "q", value: query),
+                URLQueryItem(name: "kp", value: "-2"),
+                URLQueryItem(name: "s", value: "0")
+            ])
+        ]
+        var results: [SearchResult] = []
+        var resultIndexByURL: [String: Int] = [:]
+        var lastError: Error?
+
+        for source in sources where results.count < Self.maxSearchResults {
+            do {
+                let sourceResults = try await searchSurfacePages(
+                    name: source.name,
+                    endpoint: source.endpoint,
+                    queryItems: source.queryItems,
+                    limit: min(Self.maxSurfaceResultsPerSource, Self.maxSearchResults - results.count)
+                )
+                for result in sourceResults {
+                    let key = result.url.absoluteString
+                    if let index = resultIndexByURL[key] {
+                        let existingSources = Set(results[index].source.components(separatedBy: ", "))
+                        if !existingSources.contains(result.source) {
+                            results[index].source += ", \(result.source)"
+                        }
+                    } else {
+                        resultIndexByURL[key] = results.count
+                        results.append(result)
+                        if results.count == Self.maxSearchResults { break }
+                    }
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        if results.isEmpty, let lastError { throw lastError }
+        searchCache.store(webResults: results, for: cacheKey)
+        return results
+    }
+
+    /// Restores the original direct-probe behavior for HTTP-only discovery.
+    /// Candidate generation is local; a search index is never used to decide
+    /// whether a result belongs in this mode.
+    func searchVerifiedHTTPOnly(query: String) async throws -> [SearchResult] {
+        let cacheKey = SearchCacheKey(query: normalizedQuery(query), kind: .verifiedHTTPOnly)
+        if let cached = searchCache.cachedWebResults(for: cacheKey) { return cached }
+
+        let terms = normalizedQuery(query)
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+        let candidates = Self.httpDiscoveryCandidates(for: terms)
+        guard !candidates.isEmpty else { return [] }
+
+        let results = await withTaskGroup(of: SearchResult?.self, returning: [SearchResult].self) { group in
+            var iterator = candidates.makeIterator()
+            for _ in 0..<min(Self.httpVerificationConcurrency, candidates.count) {
+                if let domain = iterator.next() {
+                    group.addTask { [self] in await verifyHTTPOnly(domain: domain, terms: terms) }
+                }
+            }
+
+            var verified: [SearchResult] = []
+            for await result in group {
+                if let result { verified.append(result) }
+                if let domain = iterator.next() {
+                    group.addTask { [self] in await verifyHTTPOnly(domain: domain, terms: terms) }
+                }
+            }
+            return verified.sorted { $0.url.host ?? "" < $1.url.host ?? "" }
+        }
+        searchCache.store(webResults: results, for: cacheKey)
+        return results
+    }
+
+    private func verifyHTTPOnly(domain: String, terms: [String]) async -> SearchResult? {
+        guard let httpURL = URL(string: "http://\(domain)") else { return nil }
+        var request = URLRequest(url: httpURL)
+        request.setValue("Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await noRedirectSession.asyncData(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              (200..<400).contains(httpResponse.statusCode) else { return nil }
+
+        let redirectsToHTTPS = httpResponse.value(forHTTPHeaderField: "Location")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("https://") ?? false
+        guard !redirectsToHTTPS else { return nil }
+
+        let httpsAvailable = await isHTTPSAvailable(for: domain)
+        guard !httpsAvailable else { return nil }
+
+        let document = Self.htmlString(from: data)
+        let html = document.lowercased()
+        let matchesTerms = terms.allSatisfy {
+            domain.localizedCaseInsensitiveContains($0) || html.contains($0)
+        }
+        guard matchesTerms else { return nil }
+
+        return SearchResult(
+            url: httpURL,
+            title: Self.pageTitle(from: document) ?? domain,
+            source: "Verified HTTP",
+            httpStatusCode: httpResponse.statusCode,
+            redirectsToHTTPS: false,
+            httpsAvailable: false
+        )
+    }
+
+    private func isHTTPSAvailable(for domain: String) async -> Bool {
+        guard let httpsURL = URL(string: "https://\(domain)") else { return false }
+        var request = URLRequest(url: httpsURL)
+        request.setValue("Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+        guard let (_, response) = try? await directSession.asyncData(for: request),
+              let http = response as? HTTPURLResponse else { return false }
+        return (200..<400).contains(http.statusCode)
+    }
+
+    private static func httpDiscoveryCandidates(for terms: [String]) -> [String] {
+        let seeds = Array(Set(terms + [terms.joined(separator: "-"), terms.joined()]))
+            .filter { !$0.isEmpty && $0.allSatisfy { $0.isLetter || $0.isNumber || $0 == "-" } }
+            .sorted()
+        var candidates: [String] = []
+        var seen = Set<String>()
+        func append(_ name: String) {
+            for tld in httpVerificationTLDs where candidates.count < maxSearchResults {
+                let domain = "\(name).\(tld)"
+                if seen.insert(domain).inserted { candidates.append(domain) }
+            }
+        }
+        for seed in seeds { append(seed) }
+        for seed in seeds {
+            for prefix in httpDiscoveryPrefixes where candidates.count < maxSearchResults {
+                append("\(prefix)\(seed)")
+            }
+        }
+        for seed in seeds {
+            for suffix in httpDiscoverySuffixes where candidates.count < maxSearchResults {
+                append("\(seed)\(suffix)")
+            }
+        }
+        return candidates
+    }
+
+    private static func extractBingResults(from data: Data) -> [SearchResult] {
+        extractResults(from: data, pattern: bingResultPattern, source: "Bing")
+    }
+
+    private static func extractDuckDuckGoResults(from data: Data) -> [SearchResult] {
+        extractResults(from: data, pattern: duckDuckGoResultPattern, source: "DuckDuckGo")
+    }
+
+    private static func extractResults(
+        from data: Data,
+        pattern: NSRegularExpression,
+        source: String
+    ) -> [SearchResult] {
+        let html = htmlString(from: data)
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        var results: [SearchResult] = []
+        var seen = Set<String>()
+        for match in pattern.matches(in: html, range: range) {
+            let hrefRange = (1..<match.numberOfRanges)
+                .compactMap { Range(match.range(at: $0), in: html) }
+                .first
+            guard let hrefRange else { continue }
+            let rawHref = String(html[hrefRange]).replacingOccurrences(of: "&amp;", with: "&")
+            let href = rawHref.hasPrefix("//") ? "https:\(rawHref)" : rawHref
+            guard let sourceURL = URL(string: href),
+                  let targetURL = destinationURL(from: sourceURL),
+                  let host = targetURL.host?.lowercased(),
+                  !host.contains("bing.com"),
+                  !host.contains("duckduckgo.com"),
+                  !host.hasSuffix(".onion"),
+                  targetURL.scheme == "http" || targetURL.scheme == "https",
+                  seen.insert(targetURL.absoluteString).inserted else { continue }
+            results.append(SearchResult(url: targetURL, title: host, source: source))
+        }
+        return results
+    }
+
+    private static func destinationURL(from sourceURL: URL) -> URL? {
+        if let components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false),
+           let redirected = components.queryItems?.first(where: { $0.name == "uddg" })?.value {
+            return URL(string: redirected)
+        }
+        return decodedBingTargetURL(from: sourceURL) ?? sourceURL
+    }
+
+    private static func nextSearchPageURL(from data: Data, baseURL: URL) -> URL? {
+        let html = htmlString(from: data)
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        for match in linkPattern.matches(in: html, range: range) {
+            guard let matchRange = Range(match.range, in: html),
+                  let hrefRange = Range(match.range(at: 1), in: html) else { continue }
+            let start = matchRange.lowerBound
+            let afterStart = matchRange.upperBound
+            let end = html.range(of: "</a>", range: afterStart..<html.endIndex)?.upperBound ?? afterStart
+            let anchor = html[start..<end].lowercased()
+            guard anchor.contains("sb_pagn") || anchor.contains("next page") || anchor.contains("aria-label=\"next\"") else { continue }
+            let rawHref = String(html[hrefRange]).replacingOccurrences(of: "&amp;", with: "&")
+            guard !rawHref.hasPrefix("javascript:"),
+                  let url = URL(string: rawHref, relativeTo: baseURL)?.absoluteURL,
+                  url.host?.lowercased() == baseURL.host?.lowercased() else { continue }
+            return url
+        }
+        return nil
+    }
+
+    private static func bingPageURL(
+        endpoint: String,
+        queryItems: [URLQueryItem],
+        token: String,
+        page: Int
+    ) -> URL? {
+        guard var components = URLComponents(string: endpoint) else { return nil }
+        components.queryItems = queryItems + [
+            URLQueryItem(name: "FPIG", value: token),
+            URLQueryItem(name: "first", value: String(page * webResultsPerPage + 1)),
+            URLQueryItem(name: "FORM", value: "PERE\(page - 1)")
+        ]
+        return components.url
+    }
+
+    private static func offsetPageURL(
+        endpoint: String,
+        queryItems: [URLQueryItem],
+        itemName: String,
+        offset: Int
+    ) -> URL? {
+        guard var components = URLComponents(string: endpoint) else { return nil }
+        components.queryItems = queryItems.filter { $0.name != itemName } + [
+            URLQueryItem(name: itemName, value: String(offset))
+        ]
+        return components.url
+    }
+
+    func clearSearchCache() {
+        searchCache.clear()
+    }
+
+    func searchCacheSummary() -> (entries: Int, results: Int) {
+        searchCache.summary()
+    }
+
+    private func normalizedQuery(_ query: String) -> String {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func searchSurfacePages(
+        name: String,
+        endpoint: String,
+        queryItems: [URLQueryItem],
+        limit: Int
+    ) async throws -> [SearchResult] {
+        var results: [SearchResult] = []
+        var seen = Set<String>()
+        guard var components = URLComponents(string: endpoint) else { throw URLError(.badURL) }
+        components.queryItems = queryItems
+        guard var nextPageURL = components.url else { throw URLError(.badURL) }
+        var bingPage = 0
+        var bingPaginationToken: String?
+        var duckDuckGoPage = 0
+
+        for _ in 0..<Self.maxSurfaceIndexPages where results.count < limit {
+            let data = try await requestData(nextPageURL)
+            let pageResults: [SearchResult]
+            switch name {
+            case "Bing":
+                pageResults = Self.extractBingResults(from: data)
+            case "Brave":
+                pageResults = Self.extractBraveResults(from: data)
+            case "DuckDuckGo":
+                pageResults = Self.extractDuckDuckGoResults(from: data)
+            default:
+                pageResults = Self.extractSurfaceResults(from: data, source: name)
+            }
+            let before = results.count
+            for result in pageResults where seen.insert(result.url.absoluteString).inserted {
+                results.append(result)
+                if results.count == limit { break }
+            }
+            guard results.count > before else { break }
+            if name == "DuckDuckGo" {
+                duckDuckGoPage += 1
+                guard let next = Self.offsetPageURL(
+                    endpoint: endpoint,
+                    queryItems: queryItems,
+                    itemName: "s",
+                    offset: duckDuckGoPage * Self.webResultsPerPage
+                ) else { break }
+                nextPageURL = next
+                continue
+            }
+
+            guard let providerNextURL = Self.nextSearchPageURL(from: data, baseURL: nextPageURL) else { break }
+            if name == "Bing" {
+                if bingPaginationToken == nil {
+                    bingPaginationToken = URLComponents(url: providerNextURL, resolvingAgainstBaseURL: false)?
+                        .queryItems?.first(where: { $0.name.caseInsensitiveCompare("FPIG") == .orderedSame })?.value
+                }
+                bingPage += 1
+                if bingPage == 1 {
+                    nextPageURL = providerNextURL
+                } else if let bingPaginationToken,
+                          let numberedPageURL = Self.bingPageURL(
+                            endpoint: endpoint,
+                            queryItems: queryItems,
+                            token: bingPaginationToken,
+                            page: bingPage
+                          ) {
+                    nextPageURL = numberedPageURL
+                } else {
+                    break
+                }
+            } else {
+                guard providerNextURL != nextPageURL else { break }
+                nextPageURL = providerNextURL
+            }
+        }
+        return results
+    }
+
+    func searchSurfaceImages(query: String) async throws -> [ImageResult] {
+        let cacheKey = SearchCacheKey(query: normalizedQuery(query), kind: .surfaceImages)
+        if let cached = searchCache.cachedImageResults(for: cacheKey) { return cached }
+        var results: [ImageResult] = []
+        var seen = Set<String>()
+        var first = 1
+
+        for _ in 0..<Self.maxSurfaceImagePages where results.count < Self.maxSearchResults {
+            guard var components = URLComponents(string: Self.bingImageSearchURL) else { throw URLError(.badURL) }
+            components.queryItems = [
+                URLQueryItem(name: "q", value: query),
+                URLQueryItem(name: "adlt", value: "off"),
+                URLQueryItem(name: "first", value: String(first))
+            ]
+            guard let url = components.url else { throw URLError(.badURL) }
+            let pageResults = Self.extractImageResults(from: try await requestData(url))
+            let before = results.count
+            for result in pageResults where seen.insert(result.imageURL.absoluteString).inserted {
+                results.append(result)
+                if results.count == Self.maxSearchResults { break }
+            }
+            guard results.count > before else { break }
+            first += Self.imageResultsPerPage
+        }
+        return results
+    }
+
+    private func requestData(_ url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.setValue("Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+        let (data, response) = try await activeSession.asyncData(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<400).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return data
+    }
+
+    private static func extractSurfaceResults(from data: Data, source: String) -> [SearchResult] {
+        let html = htmlString(from: data)
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        var results: [SearchResult] = []
+        var seen = Set<String>()
+        for match in linkPattern.matches(in: html, range: range) {
+            guard let hrefRange = Range(match.range(at: 1), in: html) else { continue }
+            let rawHref = String(html[hrefRange]).replacingOccurrences(of: "&amp;", with: "&")
+            let href = rawHref.hasPrefix("//") ? "https:\(rawHref)" : rawHref
+            guard let sourceURL = URL(string: href) else { continue }
+            let targetURL: URL?
+            if let components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false),
+               let redirected = components.queryItems?.first(where: { $0.name == "uddg" })?.value {
+                targetURL = URL(string: redirected)
+            } else {
+                targetURL = decodedBingTargetURL(from: sourceURL) ?? sourceURL
+            }
+            guard let targetURL,
+                  let host = targetURL.host?.lowercased(),
+                  !host.contains("bing.com"),
+                  !host.contains("duckduckgo.com"),
+                  !host.hasSuffix(".onion"),
+                  targetURL.scheme == "http" || targetURL.scheme == "https",
+                  seen.insert(targetURL.absoluteString).inserted else { continue }
+            results.append(SearchResult(url: targetURL, title: host, source: source))
+            if results.count == maxSearchResults { break }
+        }
+        return results
+    }
+
+    private static func decodedBingTargetURL(from url: URL) -> URL? {
+        guard url.host?.lowercased().contains("bing.com") == true,
+              let encoded = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "u" })?.value,
+              encoded.hasPrefix("a1") else { return nil }
+        var base64 = String(encoded.dropFirst(2))
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let data = Data(base64Encoded: base64), let destination = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return URL(string: destination)
+    }
+
+    private static func extractBraveResults(from data: Data) -> [SearchResult] {
+        let html = htmlString(from: data)
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        var results: [SearchResult] = []
+        var seen = Set<String>()
+        for pattern in braveResultPatterns {
+            for match in pattern.matches(in: html, range: range) {
+                guard let urlRange = Range(match.range(at: 1), in: html),
+                      let url = URL(string: String(html[urlRange]).replacingOccurrences(of: "&amp;", with: "&")),
+                      let host = url.host?.lowercased(),
+                      !host.hasSuffix(".onion"),
+                      seen.insert(url.absoluteString).inserted else { continue }
+                results.append(SearchResult(url: url, title: host, source: "Brave"))
+                if results.count == maxSearchResults { return results }
+            }
+        }
+        return results
+    }
+
+    private static func extractImageResults(from data: Data) -> [ImageResult] {
+        let html = htmlString(from: data)
+        let range = NSRange(html.startIndex..<html.endIndex, in: html)
+        var results: [ImageResult] = []
+        var seen = Set<String>()
+        for match in imageMetadataPattern.matches(in: html, range: range) {
+            guard let metadataRange = Range(match.range(at: 1), in: html) else { continue }
+            let json = String(html[metadataRange])
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&amp;", with: "&")
+            guard let jsonData = json.data(using: .utf8),
+                  let metadata = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let thumbnailString = metadata["turl"] as? String,
+                  let imageString = metadata["murl"] as? String,
+                  let pageString = metadata["purl"] as? String,
+                  let thumbnailURL = URL(string: thumbnailString),
+                  let imageURL = URL(string: imageString),
+                  let pageURL = URL(string: pageString),
+                  !thumbnailURL.host.orEmpty.hasSuffix(".onion"),
+                  !imageURL.host.orEmpty.hasSuffix(".onion"),
+                  !pageURL.host.orEmpty.hasSuffix(".onion"),
+                  seen.insert(imageURL.absoluteString).inserted else { continue }
+            let title = (metadata["t"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            results.append(ImageResult(
+                thumbnailURL: thumbnailURL,
+                imageURL: imageURL,
+                pageURL: pageURL,
+                title: title?.isEmpty == false ? title! : (pageURL.host ?? "Image")
+            ))
+        }
+        return results
+    }
+
+    private static func htmlString(from data: Data) -> String {
+        String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+    }
+
+    private static func pageTitle(from html: String) -> String? {
+        guard let match = html.range(
+            of: "<title[^>]*>(.*?)</title>",
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return nil }
+        let title = String(html[match])
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? nil : String(title.prefix(160))
     }
 }

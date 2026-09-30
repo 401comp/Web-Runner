@@ -2,13 +2,11 @@ import SwiftUI
 import AppKit
 
 private let dateFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateStyle = .medium
-    f.timeStyle = .medium
-    return f
+    let formatter = DateFormatter()
+    formatter.dateStyle = .medium
+    formatter.timeStyle = .medium
+    return formatter
 }()
-
-// MARK: - Selectable Text (NSTextField wrapper for copy support)
 
 private class ScrollPassthroughTextField: NSTextField {
     override func scrollWheel(with event: NSEvent) {
@@ -16,249 +14,364 @@ private class ScrollPassthroughTextField: NSTextField {
     }
 }
 
-struct SelectableText: NSViewRepresentable {
-    let text: String
-    var font: NSFont = .systemFont(ofSize: 12)
-    var color: NSColor = .labelColor
-    var alignment: NSTextAlignment = .left
+private final class ClickableLinkField: ScrollPassthroughTextField {
+    var linkURL: URL?
 
-    func makeNSView(context: Context) -> NSTextField {
-        let field = ScrollPassthroughTextField(labelWithString: text)
-        field.isSelectable = true
-        field.isEditable = false
-        field.drawsBackground = false
-        field.isBordered = false
-        field.lineBreakMode = .byTruncatingTail
-        field.font = font
-        field.textColor = color
-        field.alignment = alignment
-        field.setContentHuggingPriority(.defaultHigh, for: .vertical)
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return field
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 1, let linkURL {
+            NSWorkspace.shared.open(linkURL)
+        } else {
+            super.mouseDown(with: event)
+        }
     }
 
-    func updateNSView(_ nsView: NSTextField, context: Context) {
-        nsView.stringValue = text
-        nsView.font = font
-        nsView.textColor = color
-        nsView.alignment = alignment
-    }
-
-    static func mono(_ text: String, color: NSColor = .labelColor, alignment: NSTextAlignment = .left) -> SelectableText {
-        SelectableText(
-            text: text,
-            font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-            color: color,
-            alignment: alignment
-        )
+    override func resetCursorRects() {
+        if linkURL != nil { addCursorRect(bounds, cursor: .pointingHand) }
     }
 }
 
-// MARK: - View Model
+struct ActivitySpinner: NSViewRepresentable {
+    let isAnimating: Bool
+
+    func makeNSView(context: Context) -> NSProgressIndicator {
+        let indicator = NSProgressIndicator()
+        indicator.style = .spinning
+        indicator.controlSize = .small
+        indicator.isDisplayedWhenStopped = false
+        return indicator
+    }
+
+    func updateNSView(_ indicator: NSProgressIndicator, context: Context) {
+        if isAnimating { indicator.startAnimation(nil) } else { indicator.stopAnimation(nil) }
+    }
+}
+
+struct RemoteThumbnail: NSViewRepresentable {
+    let url: URL
+    let referrer: URL
+    let socksPort: Int?
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSImageView {
+        let imageView = NSImageView()
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        imageView.imageAlignment = .alignCenter
+        imageView.wantsLayer = true
+        imageView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        context.coordinator.load(url, referrer: referrer, socksPort: socksPort, into: imageView)
+        return imageView
+    }
+
+    func updateNSView(_ imageView: NSImageView, context: Context) {
+        context.coordinator.load(url, referrer: referrer, socksPort: socksPort, into: imageView)
+    }
+
+    final class Coordinator {
+        private var loadedURL: URL?
+        private var loadedReferrer: URL?
+        private var loadedSocksPort: Int?
+        private var task: URLSessionDataTask?
+
+        deinit { task?.cancel() }
+
+        func load(_ url: URL, referrer: URL, socksPort: Int?, into imageView: NSImageView) {
+            guard loadedURL != url || loadedReferrer != referrer || loadedSocksPort != socksPort else { return }
+            task?.cancel()
+            loadedURL = url
+            loadedReferrer = referrer
+            loadedSocksPort = socksPort
+            imageView.image = nil
+            let configuration = URLSessionConfiguration.ephemeral
+            if let socksPort {
+                configuration.connectionProxyDictionary = [
+                    kCFNetworkProxiesSOCKSEnable as String: true,
+                    kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+                    kCFNetworkProxiesSOCKSPort as String: socksPort
+                ]
+            }
+            let session = URLSession(configuration: configuration)
+            var request = URLRequest(url: url)
+            request.setValue(referrer.absoluteString, forHTTPHeaderField: "Referer")
+            request.setValue("Mozilla/5.0 Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+            task = session.dataTask(with: request) { [weak self, weak imageView] data, _, _ in
+                guard let self,
+                      self.loadedURL == url,
+                      self.loadedReferrer == referrer,
+                      self.loadedSocksPort == socksPort,
+                      let data,
+                      let image = NSImage(data: data) else { return }
+                DispatchQueue.main.async {
+                    guard self.loadedURL == url, self.loadedReferrer == referrer, self.loadedSocksPort == socksPort else { return }
+                    imageView?.image = image
+                }
+            }
+            task?.resume()
+        }
+    }
+}
+
+struct ImageResultGrid: View {
+    let results: [ImageResult]
+    let socksPort: Int?
+    let onCopy: (ImageResult) -> Void
+    @State private var visibleCount = 100
+
+    private var visibleResults: [ImageResult] { Array(results.prefix(visibleCount)) }
+
+    var body: some View {
+        GeometryReader { proxy in
+            let spacing: CGFloat = 12
+            let columns = max(Int(proxy.size.width / 210), 1)
+            let tileWidth = (proxy.size.width - CGFloat(columns + 1) * spacing) / CGFloat(columns)
+            let rows = Int(ceil(Double(visibleResults.count) / Double(columns)))
+
+            ScrollView {
+                VStack(spacing: spacing) {
+                    ForEach(0..<rows, id: \.self) { row in
+                        HStack(spacing: spacing) {
+                            ForEach(0..<columns, id: \.self) { column in
+                                let index = row * columns + column
+                                if index < visibleResults.count {
+                                    ImageResultTile(
+                                        result: visibleResults[index],
+                                        socksPort: socksPort,
+                                        onCopy: onCopy
+                                    )
+                                        .frame(width: tileWidth)
+                                } else {
+                                    Spacer().frame(width: tileWidth)
+                                }
+                            }
+                        }
+                    }
+                    if visibleResults.count < results.count {
+                        Button("Load 100 More") {
+                            visibleCount = min(visibleCount + 100, results.count)
+                        }
+                    }
+                }
+                .padding(spacing)
+            }
+        }
+    }
+}
+
+struct ImageResultTile: View {
+    let result: ImageResult
+    let socksPort: Int?
+    let onCopy: (ImageResult) -> Void
+
+    var body: some View {
+        tile
+    }
+
+    private var tile: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RemoteThumbnail(url: result.thumbnailURL, referrer: result.pageURL, socksPort: socksPort)
+                .frame(height: 145)
+                .clipped()
+            Text(result.title)
+                .font(.caption)
+                .lineLimit(2)
+            Text(result.pageURL.host ?? result.imageURL.host ?? "")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            Button("Copy Link") {
+                onCopy(result)
+            }
+            .buttonStyle(BorderlessButtonStyle())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(8)
+        .background(Color(NSColor.controlBackgroundColor))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.25), lineWidth: 1))
+    }
+}
+
+enum SearchMode: String, CaseIterable, Identifiable {
+    case web = "Web"
+    case images = "Image Search"
+
+    var id: String { rawValue }
+}
 
 final class ScannerViewModel: ObservableObject {
-    @Published var results: [SiteResult] = []
-    @Published var isScanning = false
+    @Published var results: [SearchResult] = []
+    @Published var imageResults: [ImageResult] = []
+    @Published var isSearching = false
     @Published var statusMessage = "Ready"
-    @Published var progress: Double = 0
-    @Published var domainsChecked = 0
-    @Published var totalDomains = 0
-    @Published var cachedProbeCount = 0
-
-    @Published var searchQuery = ""
+    @Published var searchQuery = "" {
+        didSet {
+            guard searchQuery != activeSearchQuery, !isSearching else { return }
+            results.removeAll()
+            imageResults.removeAll()
+            statusMessage = "Ready to search"
+        }
+    }
     @Published var showHTTPOnly = false
-    @Published var useTor = true
+    @Published var searchMode: SearchMode = .web
+    @Published var useTor = false
     @Published var torStatus = "Checking..."
     @Published var torChecked = false
+    @Published var activeTorPort = 0
+    @Published var cacheEntryCount = 0
+    @Published var cachedResultCount = 0
 
     private let scanner = HTTPScanner()
-    private let probeCache = ProbeCache()
     private var currentTask: Task<Void, Never>?
+    private var activeSearchQuery = ""
 
     init() {
-        scanner.useTor = true
+        scanner.useTor = false
         checkTorOnLaunch()
     }
 
+    var filteredResults: [SearchResult] {
+        showHTTPOnly ? results.filter(\.isHTTPOnly) : results
+    }
+
     func checkTorOnLaunch() {
-        torStatus = "Checking..."
         Task {
             let (connected, port) = await scanner.checkTorConnection()
             await MainActor.run {
                 torChecked = true
-                if connected {
-                    useTor = true
-                    scanner.useTor = true
-                    torStatus = "Connected :\(port)"
-                    statusMessage = "Tor connected on 127.0.0.1:\(port)"
-                } else {
-                    useTor = false
-                    scanner.useTor = false
-                    torStatus = "Disconnected"
-                    statusMessage = "Tor not detected -- click Connect to start"
-                }
+                activeTorPort = connected ? port : 0
+                scanner.useTor = false
+                torStatus = connected ? "Available :\(port)" : "Disconnected"
+                if !isSearching { statusMessage = connected ? "Tor available on 127.0.0.1:\(port)" : "Ready" }
             }
         }
     }
 
-    static let allTLDs = [
-        "com", "net", "org", "info", "biz", "io", "xyz", "site", "us", "co",
-        "fun", "online", "live", "tech", "dev", "app", "me", "tv", "cc", "in",
-        "de", "uk", "ru", "cn", "jp", "fr", "au", "ca", "br", "nl",
-        "eu", "ch", "se", "no", "fi", "dk", "pl", "cz", "at", "be",
-        "club", "shop", "store", "blog", "page", "space", "top", "pro", "mobi",
-        "name", "mx", "ar", "za", "kr", "tw", "sg", "hk", "nz", "il",
-        "onion"
-    ]
-
-    var filteredResults: [SiteResult] {
-        showHTTPOnly ? results.filter(\.isHTTPOnly) : results
+    func setUseTor(_ enabled: Bool) {
+        guard !enabled || activeTorPort != 0 else {
+            useTor = false
+            scanner.useTor = false
+            torStatus = "Tor proxy unavailable"
+            return
+        }
+        useTor = enabled
+        scanner.useTor = enabled
+        torStatus = enabled ? "Connected :\(activeTorPort)" : "Available :\(activeTorPort)"
     }
 
     func startSearch() {
-        let keywords = searchQuery
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: .whitespaces)
-            .filter { !$0.isEmpty }
-        guard !keywords.isEmpty else {
+        let label = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !label.isEmpty else {
             statusMessage = "Enter a search term"
             return
         }
-        guard !isScanning else { return }
+        guard !isSearching else { return }
+        guard !useTor || activeTorPort != 0 else {
+            statusMessage = "Tor proxy is unavailable"
+            return
+        }
 
-        isScanning = true
+        isSearching = true
         results.removeAll()
-        progress = 0
-        domainsChecked = 0
-
-        let scannerRef = scanner
-        scannerRef.useTor = useTor
-        let tlds = Self.allTLDs
-        let label = keywords.joined(separator: " ")
+        imageResults.removeAll()
+        activeSearchQuery = label
+        scanner.useTor = useTor
 
         currentTask = Task {
-            let allDomains = scannerRef.searchDomains(keywords: keywords, tlds: tlds)
-            await MainActor.run { totalDomains = allDomains.count }
-            let torLabel = scannerRef.useTor ? " (via Tor)" : ""
-            await MainActor.run { statusMessage = "Searching \(allDomains.count) domains for \"\(label)\"\(torLabel)..." }
-
-            let keywordSignature = keywords
-                .map { $0.lowercased() }
-                .sorted()
-                .joined(separator: "\u{1F}")
-            await scanDomains(
-                allDomains,
-                scanner: scannerRef,
-                searchKeywords: keywords,
-                keywordSignature: keywordSignature,
-                usesTor: scannerRef.useTor
-            )
-            let cacheCount = await probeCache.count()
-            await MainActor.run { cachedProbeCount = cacheCount }
-
-            if !Task.isCancelled {
+            do {
+                if searchMode == .images {
+                    await MainActor.run {
+                        statusMessage = useTor ? "Searching images through Tor..." : "Searching images..."
+                    }
+                    let found = try await scanner.searchSurfaceImages(query: label)
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run {
+                        imageResults = found
+                        refreshSearchCacheSummary()
+                        isSearching = false
+                        statusMessage = found.isEmpty ? "No image results found for \"\(label)\"" : "Done. \(found.count) image results for \"\(label)\"."
+                    }
+                } else {
+                    await MainActor.run {
+                        statusMessage = useTor ? "Searching the web through Tor..." : "Searching the web..."
+                    }
+                    let found: [SearchResult]
+                    if showHTTPOnly {
+                        await MainActor.run {
+                            statusMessage = "Verifying HTTP-only candidates directly..."
+                        }
+                        found = try await scanner.searchVerifiedHTTPOnly(query: label)
+                    } else {
+                        found = try await scanner.searchSurfaceWeb(query: label)
+                    }
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run {
+                        results = found
+                        refreshSearchCacheSummary()
+                        isSearching = false
+                        statusMessage = found.isEmpty
+                            ? (showHTTPOnly
+                                ? "No verified HTTP-only sites found for \"\(label)\""
+                                : "No results found for \"\(label)\"")
+                            : (showHTTPOnly
+                                ? "Done. \(found.count) verified HTTP-only sites for \"\(label)\"."
+                                : "Done. \(found.count) results for \"\(label)\" from \(sourceSummary(found)).")
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
                 await MainActor.run {
-                    isScanning = false
-                    statusMessage = "Done. \(results.count) sites contain \"\(label)\"."
+                    isSearching = false
+                    statusMessage = "\(searchMode.rawValue) search is unavailable right now"
                 }
             }
         }
     }
 
-    private func scanDomains(
-        _ domains: [String],
-        scanner scannerRef: HTTPScanner,
-        searchKeywords: [String]? = nil,
-        keywordSignature: String,
-        usesTor: Bool
-    ) async {
-        let maxConcurrent = useTor ? 6 : 25
-        let cache = probeCache
-
-        await withTaskGroup(of: SiteResult?.self) { group in
-            var iterator = domains.makeIterator()
-
-            for _ in 0..<min(maxConcurrent, domains.count) {
-                if let domain = iterator.next() {
-                    let kws = searchKeywords
-                    group.addTask {
-                        guard !Task.isCancelled else { return nil }
-                        let key = ProbeCacheKey(domain: domain, keywordSignature: keywordSignature, usesTor: usesTor)
-                        switch await cache.lookup(key) {
-                        case .hit(let result):
-                            return result
-                        case .miss:
-                            let result = await scannerRef.checkDomain(domain, searchKeywords: kws)
-                            await cache.store(result, for: key)
-                            return result
-                        }
-                    }
-                }
-            }
-
-            for await result in group {
-                guard !Task.isCancelled else { break }
-
-                await MainActor.run {
-                    domainsChecked += 1
-                    progress = Double(domainsChecked) / Double(max(totalDomains, 1))
-                    statusMessage = "Scanning... \(domainsChecked)/\(totalDomains)"
-
-                    if let result = result {
-                        results.append(result)
-                    }
-                }
-
-                if let domain = iterator.next() {
-                    let kws = searchKeywords
-                    group.addTask {
-                        guard !Task.isCancelled else { return nil }
-                        let key = ProbeCacheKey(domain: domain, keywordSignature: keywordSignature, usesTor: usesTor)
-                        switch await cache.lookup(key) {
-                        case .hit(let result):
-                            return result
-                        case .miss:
-                            let result = await scannerRef.checkDomain(domain, searchKeywords: kws)
-                            await cache.store(result, for: key)
-                            return result
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    func stopScan() {
+    func stopSearch() {
         currentTask?.cancel()
         currentTask = nil
-        isScanning = false
-        statusMessage = "Cancelled. Found \(results.count) sites so far."
+        isSearching = false
+        statusMessage = searchMode == .images ? "Search cancelled." : "Search cancelled. \(results.count) results retained."
     }
 
-    func toggleTor() {
-        useTor.toggle()
-        scanner.useTor = useTor
-        if useTor {
-            torStatus = "Checking..."
-            statusMessage = "Probing ports 9050, 9150..."
-            Task {
-                let (connected, port) = await scanner.checkTorConnection()
-                await MainActor.run {
-                    if connected {
-                        torStatus = "Connected :\(port)"
-                        statusMessage = "Tor proxy connected on 127.0.0.1:\(port)"
-                    } else {
-                        useTor = false
-                        scanner.useTor = false
-                        torStatus = "Disconnected"
-                        statusMessage = "No Tor on ports 9050/9150 -- click Connect"
-                    }
-                }
+    func clearResults() {
+        currentTask?.cancel()
+        results.removeAll()
+        imageResults.removeAll()
+        isSearching = false
+        statusMessage = "Results cleared"
+    }
+
+    func copyImageLink(_ result: ImageResult) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        statusMessage = pasteboard.setString(result.pageURL.absoluteString, forType: .string)
+            ? "Copied image result link"
+            : "Could not copy image result link"
+    }
+
+    func clearSearchCache() {
+        scanner.clearSearchCache()
+        refreshSearchCacheSummary()
+        statusMessage = "Search cache cleared"
+    }
+
+    private func refreshSearchCacheSummary() {
+        let summary = scanner.searchCacheSummary()
+        cacheEntryCount = summary.entries
+        cachedResultCount = summary.results
+    }
+
+    private func sourceSummary(_ results: [SearchResult]) -> String {
+        var sourceCounts: [String: Int] = [:]
+        for result in results {
+            for source in result.source.components(separatedBy: ", ") {
+                sourceCounts[source, default: 0] += 1
             }
-        } else {
-            torStatus = "Off"
-            statusMessage = "Tor disabled -- using direct connection"
         }
+        return sourceCounts
+            .map { "\($0.key) (\($0.value))" }
+            .sorted()
+            .joined(separator: ", ")
     }
 
     func connectTor() {
@@ -273,41 +386,17 @@ final class ScannerViewModel: ObservableObject {
             try process.run()
         } catch {
             torStatus = "Failed"
-            statusMessage = "Could not start tor -- is it installed? (brew install tor)"
+            statusMessage = "Could not start tor -- is it installed?"
             return
         }
-
         Task {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             let (connected, port) = await scanner.checkTorConnection()
             await MainActor.run {
-                if connected {
-                    useTor = true
-                    scanner.useTor = true
-                    torStatus = "Connected :\(port)"
-                    statusMessage = "Tor started and connected on 127.0.0.1:\(port)"
-                } else {
-                    torStatus = "Not ready"
-                    statusMessage = "Tor launched but not responding yet -- try toggling in a few seconds"
-                }
-            }
-        }
-    }
-
-    func clearResults() {
-        results.removeAll()
-        progress = 0
-        domainsChecked = 0
-        totalDomains = 0
-        statusMessage = "Results cleared"
-    }
-
-    func clearSearchCache() {
-        Task {
-            await probeCache.clear()
-            await MainActor.run {
-                cachedProbeCount = 0
-                statusMessage = "Search cache cleared"
+                activeTorPort = connected ? port : 0
+                scanner.useTor = connected && useTor
+                torStatus = connected ? "Connected :\(port)" : "Not ready"
+                statusMessage = connected ? "Tor connected on 127.0.0.1:\(port)" : "Tor launched but is not ready yet"
             }
         }
     }
@@ -318,317 +407,117 @@ final class ScannerViewModel: ObservableObject {
         panel.nameFieldStringValue = "WebRunner_Results.txt"
         panel.allowedFileTypes = ["txt"]
         panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
 
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        let resultsToSave = filteredResults
-        var lines: [String] = []
-        lines.append("Web-Runner Results")
-        lines.append("Generated: \(dateFormatter.string(from: Date()))")
-        lines.append(String(repeating: "=", count: 100))
-        lines.append("")
-
-        lines.append("FULL RESULTS")
-        lines.append("URL\tTitle\tDescription\tStatus\tHTTP\tType\tHTTPS?\tContent Type\tServer\tRedirect Target\tTag\tSnippet\tIP Address\tLatency")
-        for result in resultsToSave {
-            let type = result.isHTTPOnly ? "HTTP Only" : result.redirectsToHTTPS ? "Redirects to HTTPS" : "HTTP+HTTPS"
-            let title = result.pageTitle ?? "-"
-            let description = result.pageDescription ?? "-"
-            let contentType = result.contentType ?? "-"
-            let server = result.server ?? "-"
-            let redirectTarget = result.redirectTarget ?? "-"
-            let tag = result.matchedTag ?? "-"
-            let snippet = result.matchedSnippet ?? "-"
-            let ipAddress = result.pingIP ?? "-"
-            let latency = result.pingLatencyMs.map { String(format: "%.0fms", $0) } ?? "-"
-            let fields: [String] = [
-                "http://\(result.domain)",
-                title,
-                description,
-                result.pingable ? "UP" : "DOWN",
-                httpCodeLabel(result.httpStatusCode),
-                type,
-                result.httpsAvailable ? "Yes" : "No",
-                contentType,
-                server,
-                redirectTarget,
-                tag,
-                snippet,
-                ipAddress,
-                latency,
-            ]
-            lines.append(fields.joined(separator: "\t"))
+        let rows = filteredResults.map { result in
+            [result.url.absoluteString, result.title, result.source, result.url.scheme?.uppercased() ?? "-"].joined(separator: "\t")
         }
-
-        lines.append("")
-        lines.append("Total: \(resultsToSave.count) sites")
-        lines.append("")
-        lines.append("URLS ONLY")
-        for result in resultsToSave {
-            lines.append("http://\(result.domain)")
-        }
-
-        let content = lines.joined(separator: "\n")
+        let text = ([
+            "Web-Runner Results",
+            "Generated: \(dateFormatter.string(from: Date()))",
+            "",
+            "URL\tTitle\tSource\tProtocol"
+        ] + rows).joined(separator: "\n")
         do {
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            statusMessage = "Exported \(resultsToSave.count) results to \(url.lastPathComponent)"
+            try text.write(to: destination, atomically: true, encoding: .utf8)
+            statusMessage = "Exported \(filteredResults.count) results to \(destination.lastPathComponent)"
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
         }
     }
 
-}
+    func exportBookmarks() {
+        let panel = NSSavePanel()
+        panel.title = "Export Bookmarks"
+        panel.nameFieldStringValue = "WebRunner_Bookmarks.html"
+        panel.allowedFileTypes = ["html"]
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
 
-// MARK: - Progress Bar
-
-struct ProgressBar: View {
-    var value: Double
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .foregroundColor(Color.gray.opacity(0.25))
-                Rectangle()
-                    .foregroundColor(.accentColor)
-                    .frame(width: geo.size.width * CGFloat(min(max(value, 0), 1)))
-            }
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        var lines = [
+            "<!DOCTYPE NETSCAPE-Bookmark-file-1>",
+            "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">",
+            "<TITLE>Web-Runner Results</TITLE>",
+            "<H1>Web-Runner Results</H1>",
+            "<DL><p>"
+        ]
+        for result in filteredResults {
+            lines.append("    <DT><A HREF=\"\(htmlEscaped(result.url.absoluteString))\" ADD_DATE=\"\(timestamp)\">\(htmlEscaped(result.title))</A>")
         }
-        .frame(height: 6)
-        .cornerRadius(3)
-    }
-}
-
-// MARK: - HTTP Code Helper
-
-private func httpCodeLabel(_ code: Int) -> String {
-    switch code {
-    case 200: return "\(code) OK"
-    case 201: return "\(code) Created"
-    case 204: return "\(code) No Content"
-    case 301: return "\(code) Moved"
-    case 302: return "\(code) Found"
-    case 304: return "\(code) Not Modified"
-    case 400: return "\(code) Bad Req"
-    case 401: return "\(code) Unauth"
-    case 403: return "\(code) Forbidden"
-    case 404: return "\(code) Not Found"
-    case 405: return "\(code) Not Allowed"
-    case 408: return "\(code) Timeout"
-    case 410: return "\(code) Gone"
-    case 415: return "\(code) Bad Media"
-    case 429: return "\(code) Too Many"
-    case 500: return "\(code) Server Err"
-    case 502: return "\(code) Bad GW"
-    case 503: return "\(code) Unavail"
-    case 504: return "\(code) GW Timeout"
-    default:
-        if code < 300 { return "\(code) OK" }
-        if code < 400 { return "\(code) Redirect" }
-        if code < 500 { return "\(code) Client Err" }
-        return "\(code) Server Err"
-    }
-}
-
-private func httpCodeColor(_ code: Int) -> NSColor {
-    if code < 300 { return .systemGreen }
-    if code < 400 { return .systemYellow }
-    if code < 500 { return .systemOrange }
-    return .systemRed
-}
-
-// MARK: - Clickable Link
-
-private class ClickableLinkField: NSTextField {
-    var linkURL: URL?
-
-    override func mouseDown(with event: NSEvent) {
-        if event.clickCount == 1, let url = linkURL {
-            NSWorkspace.shared.open(url)
-        } else {
-            super.mouseDown(with: event)
+        lines.append("</DL><p>")
+        do {
+            try lines.joined(separator: "\n").write(to: destination, atomically: true, encoding: .utf8)
+            statusMessage = "Exported \(filteredResults.count) bookmarks to \(destination.lastPathComponent)"
+        } catch {
+            statusMessage = "Bookmark export failed: \(error.localizedDescription)"
         }
     }
 
-    override func scrollWheel(with event: NSEvent) {
-        nextResponder?.scrollWheel(with: event)
-    }
-
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: .pointingHand)
-    }
-}
-
-struct ClickableText: NSViewRepresentable {
-    let text: String
-    let url: URL?
-    var font: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
-    var color: NSColor = .linkColor
-
-    func makeNSView(context: Context) -> NSTextField {
-        let field = ClickableLinkField(labelWithString: text)
-        field.linkURL = url
-        field.isSelectable = true
-        field.isEditable = false
-        field.drawsBackground = false
-        field.isBordered = false
-        field.lineBreakMode = .byTruncatingTail
-        field.font = font
-        field.textColor = color
-        field.setContentHuggingPriority(.defaultHigh, for: .vertical)
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return field
-    }
-
-    func updateNSView(_ nsView: NSTextField, context: Context) {
-        nsView.stringValue = text
-        nsView.font = font
-        nsView.textColor = color
-        (nsView as? ClickableLinkField)?.linkURL = url
+    private func htmlEscaped(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }
 
-// MARK: - Resizable Table View
-
-class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource {
-    var results: [SiteResult] = []
-    var sortedResults: [SiteResult] = []
-    var showHTTPOnly = false
+final class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource {
+    var results: [SearchResult] = []
+    private var sortedResults: [SearchResult] = []
 
     func applySort(_ descriptors: [NSSortDescriptor]) {
-        guard let desc = descriptors.first, let key = desc.key else {
+        guard let descriptor = descriptors.first, let key = descriptor.key else {
             sortedResults = results
             return
         }
-        let asc = desc.ascending
-        sortedResults = results.sorted { a, b in
-            let cmp: Bool
+        sortedResults = results.sorted { lhs, rhs in
+            let comparison: ComparisonResult
             switch key {
-            case "domain":
-                cmp = a.domain.localizedCaseInsensitiveCompare(b.domain) == .orderedAscending
-            case "title":
-                cmp = (a.pageTitle ?? "~").localizedCaseInsensitiveCompare(b.pageTitle ?? "~") == .orderedAscending
-            case "description":
-                cmp = (a.pageDescription ?? "~").localizedCaseInsensitiveCompare(b.pageDescription ?? "~") == .orderedAscending
-            case "status":
-                cmp = (a.pingable ? 1 : 0) < (b.pingable ? 1 : 0)
-            case "http":
-                cmp = a.httpStatusCode < b.httpStatusCode
-            case "type":
-                func typeRank(_ r: SiteResult) -> Int {
-                    r.isHTTPOnly ? 0 : r.redirectsToHTTPS ? 1 : 2
-                }
-                cmp = typeRank(a) < typeRank(b)
-            case "https":
-                cmp = (a.httpsAvailable ? 1 : 0) < (b.httpsAvailable ? 1 : 0)
-            case "contentType":
-                cmp = (a.contentType ?? "~").localizedCaseInsensitiveCompare(b.contentType ?? "~") == .orderedAscending
-            case "server":
-                cmp = (a.server ?? "~").localizedCaseInsensitiveCompare(b.server ?? "~") == .orderedAscending
-            case "redirect":
-                cmp = (a.redirectTarget ?? "~").localizedCaseInsensitiveCompare(b.redirectTarget ?? "~") == .orderedAscending
-            case "tag":
-                cmp = (a.matchedTag ?? "~") < (b.matchedTag ?? "~")
-            case "snippet":
-                cmp = (a.matchedSnippet ?? "~") < (b.matchedSnippet ?? "~")
-            case "ip":
-                cmp = (a.pingIP ?? "~") < (b.pingIP ?? "~")
-            case "latency":
-                cmp = (a.pingLatencyMs ?? .infinity) < (b.pingLatencyMs ?? .infinity)
-            default:
-                cmp = false
+            case "url": comparison = lhs.url.absoluteString.localizedCaseInsensitiveCompare(rhs.url.absoluteString)
+            case "title": comparison = lhs.title.localizedCaseInsensitiveCompare(rhs.title)
+            case "source": comparison = lhs.source.localizedCaseInsensitiveCompare(rhs.source)
+            case "protocol": comparison = (lhs.url.scheme ?? "").localizedCaseInsensitiveCompare(rhs.url.scheme ?? "")
+            default: comparison = .orderedSame
             }
-            return asc ? cmp : !cmp
+            return descriptor.ascending ? comparison == .orderedAscending : comparison == .orderedDescending
         }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { sortedResults.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard row < sortedResults.count, let colID = tableColumn?.identifier.rawValue else { return nil }
+        guard row < sortedResults.count, let id = tableColumn?.identifier.rawValue else { return nil }
         let result = sortedResults[row]
-
-        switch colID {
-        case "domain":
-            let field = ClickableLinkField(labelWithString: "http://\(result.domain)")
-            field.linkURL = URL(string: "http://\(result.domain)")
-            field.isSelectable = true
-            field.isEditable = false
-            field.drawsBackground = false
-            field.isBordered = false
-            field.lineBreakMode = .byTruncatingTail
-            field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-            field.textColor = .linkColor
-            return field
+        switch id {
+        case "url":
+            let field = ClickableLinkField(labelWithString: result.url.absoluteString)
+            field.linkURL = result.url
+            return configure(field, font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .linkColor)
         case "title":
-            return makeLabel(result.pageTitle ?? "-", color: result.pageTitle == nil ? .tertiaryLabelColor : .labelColor)
-        case "description":
-            return makeLabel(result.pageDescription ?? "-", font: .systemFont(ofSize: 11), color: result.pageDescription == nil ? .tertiaryLabelColor : .secondaryLabelColor)
-        case "status":
-            return makeLabel(result.pingable ? "UP" : "DOWN",
-                             font: .monospacedSystemFont(ofSize: 11, weight: .bold),
-                             color: result.pingable ? .systemGreen : .systemRed,
-                             alignment: .center)
-        case "http":
-            return makeLabel(httpCodeLabel(result.httpStatusCode),
-                             font: .monospacedSystemFont(ofSize: 11, weight: .regular),
-                             color: httpCodeColor(result.httpStatusCode))
-        case "type":
-            let text = result.isHTTPOnly ? "HTTP Only" : result.redirectsToHTTPS ? "Redirects" : "HTTP+HTTPS"
-            let color: NSColor = result.isHTTPOnly ? .systemOrange : result.redirectsToHTTPS ? .systemBlue : .secondaryLabelColor
-            let font: NSFont = result.isHTTPOnly ? .monospacedSystemFont(ofSize: 11, weight: .semibold) : .systemFont(ofSize: 11)
-            return makeLabel(text, font: font, color: color)
-        case "https":
-            let text = result.httpsAvailable ? "Yes" : "No"
-            let color: NSColor = result.httpsAvailable ? .systemGreen : .secondaryLabelColor
-            return makeLabel(text, font: .systemFont(ofSize: 11, weight: .medium), color: color, alignment: .center)
-        case "contentType":
-            return makeLabel(result.contentType ?? "-", font: .monospacedSystemFont(ofSize: 11, weight: .regular), color: result.contentType == nil ? .tertiaryLabelColor : .labelColor)
-        case "server":
-            return makeLabel(result.server ?? "-", font: .monospacedSystemFont(ofSize: 11, weight: .regular), color: result.server == nil ? .tertiaryLabelColor : .labelColor)
-        case "redirect":
-            return makeLabel(result.redirectTarget ?? "-", font: .systemFont(ofSize: 11), color: result.redirectTarget == nil ? .tertiaryLabelColor : .secondaryLabelColor)
-        case "tag":
-            return makeLabel(result.matchedTag ?? "-",
-                             color: result.matchedTag != nil ? .systemPurple : .tertiaryLabelColor,
-                             alignment: .center)
-        case "snippet":
-            if let snippet = result.matchedSnippet {
-                let field = ClickableLinkField(labelWithString: snippet)
-                field.linkURL = URL(string: "http://\(result.domain)")
-                field.isSelectable = true
-                field.isEditable = false
-                field.drawsBackground = false
-                field.isBordered = false
-                field.lineBreakMode = .byTruncatingTail
-                field.font = .systemFont(ofSize: 11)
-                field.textColor = .linkColor
-                return field
-            }
-            return makeLabel("-", color: .tertiaryLabelColor)
-        case "ip":
-            return makeLabel(result.pingIP ?? "-",
-                             font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                             color: result.pingIP != nil ? .labelColor : .tertiaryLabelColor)
-        case "latency":
-            return makeLabel(result.pingLatencyMs.map { String(format: "%.0f", $0) + "ms" } ?? "-",
-                             font: .monospacedSystemFont(ofSize: 12, weight: .regular),
-                             color: result.pingLatencyMs != nil ? .secondaryLabelColor : .tertiaryLabelColor,
-                             alignment: .right)
+            return label(result.title)
+        case "source":
+            return label(result.source, color: .secondaryLabelColor)
+        case "protocol":
+            return label((result.url.scheme ?? "-").uppercased(), font: .monospacedSystemFont(ofSize: 11, weight: .medium), color: result.isHTTPOnly ? .systemOrange : .secondaryLabelColor, alignment: .center)
         default:
             return nil
         }
     }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 22 }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 24 }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
         applySort(tableView.sortDescriptors)
         tableView.reloadData()
     }
 
-    private func makeLabel(_ text: String, font: NSFont = .systemFont(ofSize: 12), color: NSColor = .labelColor, alignment: NSTextAlignment = .left) -> NSTextField {
-        let field = ScrollPassthroughTextField(labelWithString: text)
+    private func label(_ text: String, font: NSFont = .systemFont(ofSize: 12), color: NSColor = .labelColor, alignment: NSTextAlignment = .left) -> NSTextField {
+        configure(ScrollPassthroughTextField(labelWithString: text), font: font, color: color, alignment: alignment)
+    }
+
+    private func configure(_ field: NSTextField, font: NSFont, color: NSColor, alignment: NSTextAlignment = .left) -> NSTextField {
         field.isSelectable = true
         field.isEditable = false
         field.drawsBackground = false
@@ -642,273 +531,181 @@ class ResultsTableDelegate: NSObject, NSTableViewDelegate, NSTableViewDataSource
 }
 
 struct ResultsTableView: NSViewRepresentable {
-    let results: [SiteResult]
-    let showHTTPOnly: Bool
+    let results: [SearchResult]
 
-    func makeCoordinator() -> ResultsTableDelegate {
-        ResultsTableDelegate()
-    }
+    func makeCoordinator() -> ResultsTableDelegate { ResultsTableDelegate() }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
-
         let tableView = NSTableView()
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         tableView.allowsColumnResizing = true
-        tableView.allowsColumnReordering = false
         tableView.intercellSpacing = NSSize(width: 6, height: 2)
-        tableView.rowHeight = 22
-
-        addColumns(to: tableView, showHTTPOnly: showHTTPOnly)
-
+        for column in [
+            ("url", "URL", 410.0, 180.0, 900.0),
+            ("title", "Title", 260.0, 120.0, 600.0),
+            ("source", "Source", 115.0, 75.0, 180.0),
+            ("protocol", "Protocol", 75.0, 60.0, 100.0)
+        ] {
+            let tableColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(column.0))
+            tableColumn.title = column.1
+            tableColumn.width = CGFloat(column.2)
+            tableColumn.minWidth = CGFloat(column.3)
+            tableColumn.maxWidth = CGFloat(column.4)
+            tableColumn.sortDescriptorPrototype = NSSortDescriptor(key: column.0, ascending: true)
+            tableView.addTableColumn(tableColumn)
+        }
         tableView.delegate = context.coordinator
         tableView.dataSource = context.coordinator
-
         scrollView.documentView = tableView
         return scrollView
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let tableView = scrollView.documentView as? NSTableView else { return }
-
-        let httpsCol = tableView.tableColumns.first { $0.identifier.rawValue == "https" }
-        if showHTTPOnly && httpsCol == nil {
-            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("https"))
-            col.title = "HTTPS?"
-            col.width = 52
-            col.minWidth = 40
-            col.maxWidth = 100
-            col.sortDescriptorPrototype = NSSortDescriptor(key: "https", ascending: true)
-            let typeIndex = tableView.tableColumns.firstIndex { $0.identifier.rawValue == "type" } ?? 3
-            tableView.addTableColumn(col)
-            tableView.moveColumn(tableView.column(withIdentifier: col.identifier), toColumn: typeIndex + 1)
-        } else if !showHTTPOnly, let existing = httpsCol {
-            tableView.removeTableColumn(existing)
-        }
-
         context.coordinator.results = results
         context.coordinator.applySort(tableView.sortDescriptors)
-        context.coordinator.showHTTPOnly = showHTTPOnly
         tableView.reloadData()
     }
-
-    private func addColumns(to tableView: NSTableView, showHTTPOnly: Bool) {
-        let cols: [(id: String, title: String, width: CGFloat, min: CGFloat, max: CGFloat)] = [
-            ("domain",  "Domain",     220, 120, 600),
-            ("title",   "Title",      180, 100, 500),
-            ("description", "Description", 280, 140, 800),
-            ("status",  "Status",      46,  36,  80),
-            ("http",    "HTTP",        90,  60, 150),
-            ("type",    "Type",        80,  55, 140),
-            ("contentType", "Content Type", 120, 85, 260),
-            ("server", "Server",      120, 80, 280),
-            ("redirect", "Redirect Target", 220, 120, 600),
-            ("tag",     "Tag",         70,  40, 140),
-            ("snippet", "Snippet",    200, 100, 800),
-            ("ip",      "IP Address", 115,  80, 180),
-            ("latency", "Latency",     55,  40, 100),
-        ]
-        for c in cols {
-            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(c.id))
-            col.title = c.title
-            col.width = c.width
-            col.minWidth = c.min
-            col.maxWidth = c.max
-            col.sortDescriptorPrototype = NSSortDescriptor(key: c.id, ascending: true)
-            tableView.addTableColumn(col)
-        }
-
-        if showHTTPOnly {
-            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("https"))
-            col.title = "HTTPS?"
-            col.width = 52
-            col.minWidth = 40
-            col.maxWidth = 100
-            col.sortDescriptorPrototype = NSSortDescriptor(key: "https", ascending: true)
-            let typeIndex = tableView.tableColumns.firstIndex { $0.identifier.rawValue == "type" } ?? 3
-            tableView.addTableColumn(col)
-            tableView.moveColumn(tableView.column(withIdentifier: col.identifier), toColumn: typeIndex + 1)
-        }
-    }
 }
-
-// MARK: - Main View
 
 struct ContentView: View {
     @ObservedObject private var vm = ScannerViewModel()
 
     var body: some View {
         HStack(spacing: 0) {
-            sidebar
-                .frame(width: 210)
-                .padding()
-
+            sidebar.frame(width: 210).padding()
             Divider()
-
             VStack(spacing: 0) {
-                searchBar
-                    .padding(.horizontal)
-                    .padding(.vertical, 10)
-
+                searchBar.padding(.horizontal).padding(.vertical, 10)
                 Divider()
-
                 resultsArea
-
                 Divider()
-
-                statusBar
-                    .padding(.horizontal)
-                    .padding(.vertical, 8)
+                statusBar.padding(.horizontal).padding(.vertical, 8)
             }
         }
     }
 
-    // MARK: - Sidebar
-
     private var sidebar: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                if vm.isScanning {
-                    Button(action: vm.stopScan) {
-                        Text("Stop")
-                            .foregroundColor(.red)
-                            .frame(maxWidth: .infinity)
+                if vm.isSearching {
+                    Button(action: vm.stopSearch) {
+                        Text("Stop").foregroundColor(.red).frame(maxWidth: .infinity)
                     }
                 }
-
                 Button(action: vm.clearResults) {
-                    Text("Clear All")
-                        .frame(maxWidth: .infinity)
+                    Text("Clear All").frame(maxWidth: .infinity)
                 }
-                .disabled(vm.isScanning || vm.results.isEmpty)
-
-                Text("Search cache")
-                    .font(.headline)
-
-                Text("\(vm.cachedProbeCount) recent probes (10 min)")
+                .disabled(vm.isSearching || (vm.results.isEmpty && vm.imageResults.isEmpty))
+                Button(action: vm.clearSearchCache) {
+                    Text("Clear Search Cache").frame(maxWidth: .infinity)
+                }
+                .disabled(vm.isSearching)
+                Text("Search cache: \(vm.cacheEntryCount) entries, \(vm.cachedResultCount) results (10 min)")
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                Button(action: vm.clearSearchCache) {
-                    Text("Clear Search Cache")
-                        .frame(maxWidth: .infinity)
-                }
-                .disabled(vm.isScanning || vm.cachedProbeCount == 0)
+                Divider()
+                Text("Display").font(.headline)
+                Toggle(
+                    vm.searchMode == .images ? "Verified HTTP-only (disabled)" : "Verified HTTP-only",
+                    isOn: $vm.showHTTPOnly
+                )
+                    .disabled(vm.searchMode == .images)
 
                 Divider()
-
-                Text("Display")
-                    .font(.headline)
-
-                Toggle("HTTP-Only results", isOn: $vm.showHTTPOnly)
-
-                Divider()
-
-                Text("Tor Proxy")
-                    .font(.headline)
-
-                Toggle("Use Tor (SOCKS5)", isOn: Binding(
-                    get: { vm.useTor },
-                    set: { _ in vm.toggleTor() }
-                ))
-                .disabled(vm.isScanning)
-
-                if !vm.torStatus.isEmpty {
-                    Text(vm.torStatus)
-                        .font(.caption)
-                        .foregroundColor(vm.torStatus.hasPrefix("Connected") ? .green : .orange)
-                }
-
-                if !vm.useTor && vm.torChecked {
+                Text("Tor Proxy").font(.headline)
+                Toggle("Use Tor (SOCKS5)", isOn: Binding(get: { vm.useTor }, set: vm.setUseTor))
+                    .disabled(vm.isSearching || vm.activeTorPort == 0)
+                Text(vm.torStatus)
+                    .font(.caption)
+                    .foregroundColor(vm.torStatus.hasPrefix("Connected") ? .green : .orange)
+                if vm.activeTorPort == 0 {
                     Button(action: vm.connectTor) {
-                        Text("Connect")
-                            .frame(maxWidth: .infinity)
+                        Text("Connect").frame(maxWidth: .infinity)
                     }
                     .disabled(vm.torStatus == "Starting...")
                 }
 
                 Spacer(minLength: 20)
-
                 Button(action: vm.exportResults) {
-                    Text("Export Results")
-                        .frame(maxWidth: .infinity)
+                    Text("Export Results").frame(maxWidth: .infinity)
+                }
+                .disabled(vm.filteredResults.isEmpty)
+                Button(action: vm.exportBookmarks) {
+                    Text("Export Bookmarks").frame(maxWidth: .infinity)
                 }
                 .disabled(vm.filteredResults.isEmpty)
             }
         }
     }
 
-    // MARK: - Search Bar
-
     private var searchBar: some View {
-        HStack(spacing: 8) {
-            Text("Search:")
-                .foregroundColor(.secondary)
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                Picker("Search mode", selection: $vm.searchMode) {
+                    ForEach(SearchMode.allCases) { mode in Text(mode.rawValue).tag(mode) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 190)
+                .disabled(vm.isSearching)
 
-            TextField("keywords (e.g. weather news shop)",
-                      text: $vm.searchQuery,
-                      onCommit: vm.startSearch)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-
-            Button("Search", action: vm.startSearch)
-                .disabled(vm.isScanning || vm.searchQuery.trimmingCharacters(in: .whitespaces).isEmpty)
+                Spacer()
+            }
+            HStack(spacing: 8) {
+                TextField("Search terms", text: $vm.searchQuery, onCommit: vm.startSearch)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                Button("Search", action: vm.startSearch)
+                    .disabled(vm.isSearching || vm.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
         }
     }
-
-    // MARK: - Results
 
     private var resultsArea: some View {
         VStack(spacing: 0) {
-            if vm.filteredResults.isEmpty && !vm.isScanning {
+            if vm.searchMode == .images && !vm.imageResults.isEmpty {
+                ImageResultGrid(
+                    results: vm.imageResults,
+                    socksPort: vm.useTor ? vm.activeTorPort : nil,
+                    onCopy: vm.copyImageLink
+                )
+                    .id(vm.imageResults.first?.id)
+            } else if vm.searchMode == .web && !vm.filteredResults.isEmpty {
+                ResultsTableView(results: vm.filteredResults)
+            } else if !vm.isSearching {
                 Spacer()
-                Text("No Results")
-                    .font(.title)
-                    .foregroundColor(.secondary)
-                Text("Enter keywords above to find HTTP sites.")
+                Text("No Results").font(.title).foregroundColor(.secondary)
+                Text("Enter search terms above.")
                     .font(.caption)
                     .foregroundColor(Color.secondary.opacity(0.7))
-                    .multilineTextAlignment(.center)
                     .padding(.top, 4)
                 Spacer()
             } else {
-                ResultsTableView(
-                    results: vm.filteredResults,
-                    showHTTPOnly: vm.showHTTPOnly
-                )
+                Spacer()
+                Spacer()
             }
         }
     }
 
-    // MARK: - Status Bar
-
     private var statusBar: some View {
         HStack(spacing: 12) {
-            if vm.isScanning {
-                ProgressBar(value: vm.progress)
-                    .frame(width: 140)
+            if vm.isSearching {
+                ActivitySpinner(isAnimating: true).frame(width: 16, height: 16)
             }
-
-            Text(vm.statusMessage)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-
+            Text(vm.statusMessage).font(.caption).foregroundColor(.secondary).lineLimit(1)
             Spacer()
-
-            if !vm.results.isEmpty {
+            if vm.searchMode == .images && !vm.imageResults.isEmpty {
+                Text("Images: \(vm.imageResults.count)").font(.caption).foregroundColor(.secondary)
+            } else if !vm.results.isEmpty {
                 Text(vm.showHTTPOnly ? "Showing: \(vm.filteredResults.count) of \(vm.results.count)" : "Results: \(vm.results.count)")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule()
-                            .fill(Color.gray.opacity(0.2))
-                    )
             }
         }
     }
