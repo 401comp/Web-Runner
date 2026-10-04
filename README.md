@@ -9,13 +9,11 @@ A lightweight macOS search utility for surface-web results and image results.
 ## Features
 
 - **Web and image search** -- surface-web searches use Bing, Brave, and DuckDuckGo; image results appear in an in-app grid.
-- **Reliable image grid** -- thumbnails use an in-memory cache, eight-at-a-time loading, referrer retry, and full-image fallback when a thumbnail host fails.
 - **Copy image links** -- image cards copy their source-page URL to the clipboard without opening a browser.
 - **Verified HTTP-only mode** -- directly checks generated candidates and shows only sites that respond over HTTP without HTTPS.
 - **Optional Tor proxy** -- route ordinary surface-web and image requests through a local SOCKS5 proxy on port 9050 or 9150.
-- **Cache controls** -- recent result sets are held in memory for 10 minutes; the sidebar shows image-cache size in MB, clears both caches manually, and clears image data again on app quit.
-- **Network status** -- shows whether macOS reports a VPN/tunnel interface and the current public IP address.
-- **Exports** -- save visible web results as text or browser-compatible Netscape bookmark HTML with canonical URL de-duplication.
+- **Search cache** -- recent result sets are held in memory for 10 minutes and can be cleared from the sidebar.
+- **Exports** -- save visible web results as text or browser-compatible Netscape bookmark HTML.
 - **Native result table** -- sortable, resizable URL, title, source, and protocol columns.
 
 Web-Runner searches the ordinary web only. It does not query, crawl, or return `.onion` services.
