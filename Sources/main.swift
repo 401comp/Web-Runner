@@ -28,6 +28,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        ImageMemoryCache.shared.clear()
+    }
+
     private func setupMenuBar() {
         let mainMenu = NSMenu()
 

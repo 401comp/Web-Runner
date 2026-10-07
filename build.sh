@@ -10,7 +10,7 @@
 set -euo pipefail
 
 APP_NAME="Web-Runner"
-APP_VERSION="1.1.12"
+APP_VERSION="1.1.14"
 BUNDLE_ID="com.saltz.webrunner"
 EXEC_NAME="WebRunner"            # binary name from Package.swift target
 ROOT="$(cd "$(dirname "$0")" && pwd)"

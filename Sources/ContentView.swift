@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 private let dateFormatter: DateFormatter = {
     let formatter = DateFormatter()
@@ -46,8 +47,129 @@ struct ActivitySpinner: NSViewRepresentable {
     }
 }
 
+final class ImageMemoryCache: @unchecked Sendable {
+    static let shared = ImageMemoryCache()
+
+    private struct Entry {
+        let image: NSImage
+        let byteCount: Int
+        var lastAccess: Date
+    }
+
+    private let lock = NSLock()
+    private let byteLimit = 80 * 1024 * 1024
+    private var entries: [String: Entry] = [:]
+    private var totalBytes = 0
+
+    func image(for key: String) -> NSImage? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var entry = entries[key] else { return nil }
+        entry.lastAccess = Date()
+        entries[key] = entry
+        return entry.image
+    }
+
+    func store(_ image: NSImage, data: Data, for key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let previous = entries[key] { totalBytes -= previous.byteCount }
+        entries[key] = Entry(image: image, byteCount: data.count, lastAccess: Date())
+        totalBytes += data.count
+        while totalBytes > byteLimit, let oldest = entries.min(by: { $0.value.lastAccess < $1.value.lastAccess }) {
+            totalBytes -= oldest.value.byteCount
+            entries[oldest.key] = nil
+        }
+    }
+
+    func summary() -> (entries: Int, bytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (entries.count, totalBytes)
+    }
+
+    func clear() {
+        lock.lock()
+        entries.removeAll()
+        totalBytes = 0
+        lock.unlock()
+    }
+}
+
+private actor ThumbnailLoader {
+    static let shared = ThumbnailLoader()
+
+    private let maximumConcurrentLoads = 8
+    private var activeLoads = 0
+    private var waitingLoads: [CheckedContinuation<Void, Never>] = []
+
+    func load(thumbnailURL: URL, fallbackURL: URL, referrer: URL, socksPort: Int?) async -> NSImage? {
+        for candidate in [thumbnailURL, fallbackURL] where ImageMemoryCache.shared.image(for: candidate.absoluteString) == nil {
+            for referer in [referrer, nil] {
+                await acquireSlot()
+                let data = await requestData(from: candidate, referrer: referer, socksPort: socksPort)
+                releaseSlot()
+                if let data, let image = NSImage(data: data) {
+                    ImageMemoryCache.shared.store(image, data: data, for: candidate.absoluteString)
+                    return image
+                }
+            }
+        }
+        return ImageMemoryCache.shared.image(for: thumbnailURL.absoluteString)
+            ?? ImageMemoryCache.shared.image(for: fallbackURL.absoluteString)
+    }
+
+    private func acquireSlot() async {
+        if activeLoads < maximumConcurrentLoads {
+            activeLoads += 1
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waitingLoads.append(continuation)
+        }
+    }
+
+    private func releaseSlot() {
+        if let next = waitingLoads.first {
+            waitingLoads.removeFirst()
+            next.resume()
+        } else {
+            activeLoads -= 1
+        }
+    }
+
+    private func requestData(from url: URL, referrer: URL?, socksPort: Int?) async -> Data? {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 20
+        configuration.waitsForConnectivity = false
+        if let socksPort {
+            configuration.connectionProxyDictionary = [
+                kCFNetworkProxiesSOCKSEnable as String: true,
+                kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
+                kCFNetworkProxiesSOCKSPort as String: socksPort
+            ]
+        }
+        var request = URLRequest(url: url)
+        if let referrer { request.setValue(referrer.absoluteString, forHTTPHeaderField: "Referer") }
+        request.setValue("Mozilla/5.0 Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+        return await withCheckedContinuation { continuation in
+            URLSession(configuration: configuration).dataTask(with: request) { data, response, error in
+                guard error == nil,
+                      let response = response as? HTTPURLResponse,
+                      (200..<400).contains(response.statusCode) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: data)
+            }.resume()
+        }
+    }
+}
+
 struct RemoteThumbnail: NSViewRepresentable {
     let url: URL
+    let fallbackURL: URL
     let referrer: URL
     let socksPort: Int?
 
@@ -59,54 +181,52 @@ struct RemoteThumbnail: NSViewRepresentable {
         imageView.imageAlignment = .alignCenter
         imageView.wantsLayer = true
         imageView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        context.coordinator.load(url, referrer: referrer, socksPort: socksPort, into: imageView)
+        context.coordinator.load(url, fallbackURL: fallbackURL, referrer: referrer, socksPort: socksPort, into: imageView)
         return imageView
     }
 
     func updateNSView(_ imageView: NSImageView, context: Context) {
-        context.coordinator.load(url, referrer: referrer, socksPort: socksPort, into: imageView)
+        context.coordinator.load(url, fallbackURL: fallbackURL, referrer: referrer, socksPort: socksPort, into: imageView)
     }
 
-    final class Coordinator {
+    final class Coordinator: @unchecked Sendable {
         private var loadedURL: URL?
+        private var loadedFallbackURL: URL?
         private var loadedReferrer: URL?
         private var loadedSocksPort: Int?
-        private var task: URLSessionDataTask?
+        private var task: Task<Void, Never>?
 
         deinit { task?.cancel() }
 
-        func load(_ url: URL, referrer: URL, socksPort: Int?, into imageView: NSImageView) {
-            guard loadedURL != url || loadedReferrer != referrer || loadedSocksPort != socksPort else { return }
+        func load(_ url: URL, fallbackURL: URL, referrer: URL, socksPort: Int?, into imageView: NSImageView) {
+            guard loadedURL != url || loadedFallbackURL != fallbackURL || loadedReferrer != referrer || loadedSocksPort != socksPort else { return }
             task?.cancel()
             loadedURL = url
+            loadedFallbackURL = fallbackURL
             loadedReferrer = referrer
             loadedSocksPort = socksPort
             imageView.image = nil
-            let configuration = URLSessionConfiguration.ephemeral
-            if let socksPort {
-                configuration.connectionProxyDictionary = [
-                    kCFNetworkProxiesSOCKSEnable as String: true,
-                    kCFNetworkProxiesSOCKSProxy as String: "127.0.0.1",
-                    kCFNetworkProxiesSOCKSPort as String: socksPort
-                ]
+            if let image = ImageMemoryCache.shared.image(for: url.absoluteString)
+                ?? ImageMemoryCache.shared.image(for: fallbackURL.absoluteString) {
+                imageView.image = image
+                return
             }
-            let session = URLSession(configuration: configuration)
-            var request = URLRequest(url: url)
-            request.setValue(referrer.absoluteString, forHTTPHeaderField: "Referer")
-            request.setValue("Mozilla/5.0 Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
-            task = session.dataTask(with: request) { [weak self, weak imageView] data, _, _ in
-                guard let self,
-                      self.loadedURL == url,
-                      self.loadedReferrer == referrer,
-                      self.loadedSocksPort == socksPort,
-                      let data,
-                      let image = NSImage(data: data) else { return }
+            task = Task { [weak self, weak imageView] in
+                guard let image = await ThumbnailLoader.shared.load(
+                    thumbnailURL: url,
+                    fallbackURL: fallbackURL,
+                    referrer: referrer,
+                    socksPort: socksPort
+                ) else { return }
                 DispatchQueue.main.async {
-                    guard self.loadedURL == url, self.loadedReferrer == referrer, self.loadedSocksPort == socksPort else { return }
+                    guard let self,
+                          self.loadedURL == url,
+                          self.loadedFallbackURL == fallbackURL,
+                          self.loadedReferrer == referrer,
+                          self.loadedSocksPort == socksPort else { return }
                     imageView?.image = image
                 }
             }
-            task?.resume()
         }
     }
 }
@@ -129,7 +249,7 @@ struct ImageResultGrid: View {
             ScrollView {
                 VStack(spacing: spacing) {
                     ForEach(0..<rows, id: \.self) { row in
-                        HStack(spacing: spacing) {
+                        HStack(alignment: .top, spacing: spacing) {
                             ForEach(0..<columns, id: \.self) { column in
                                 let index = row * columns + column
                                 if index < visibleResults.count {
@@ -168,12 +288,13 @@ struct ImageResultTile: View {
 
     private var tile: some View {
         VStack(alignment: .leading, spacing: 6) {
-            RemoteThumbnail(url: result.thumbnailURL, referrer: result.pageURL, socksPort: socksPort)
+            RemoteThumbnail(url: result.thumbnailURL, fallbackURL: result.imageURL, referrer: result.pageURL, socksPort: socksPort)
                 .frame(height: 145)
                 .clipped()
             Text(result.title)
                 .font(.caption)
                 .lineLimit(2)
+                .frame(height: 30, alignment: .topLeading)
             Text(result.pageURL.host ?? result.imageURL.host ?? "")
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -184,6 +305,7 @@ struct ImageResultTile: View {
             .buttonStyle(BorderlessButtonStyle())
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: 230, alignment: .top)
         .padding(8)
         .background(Color(NSColor.controlBackgroundColor))
         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.25), lineWidth: 1))
@@ -195,6 +317,43 @@ enum SearchMode: String, CaseIterable, Identifiable {
     case images = "Image Search"
 
     var id: String { rawValue }
+}
+
+struct ExportEntry {
+    let url: URL
+    let imageURL: URL?
+    let title: String
+    let source: String
+    let kind: String
+}
+
+private enum NetworkStatusReader {
+    static func vpnOrTunnelPresent() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return output.range(of: "(?m)^utun[0-9]+:", options: .regularExpression) != nil
+    }
+
+    static func fetchPublicIPAddress(completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: "https://api64.ipify.org") else {
+            completion(nil)
+            return
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue("Web-Runner/1.1", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let address = data.flatMap { String(data: $0, encoding: .utf8) }?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            completion(address?.isEmpty == false ? address : nil)
+        }.resume()
+    }
 }
 
 final class ScannerViewModel: ObservableObject {
@@ -218,6 +377,10 @@ final class ScannerViewModel: ObservableObject {
     @Published var activeTorPort = 0
     @Published var cacheEntryCount = 0
     @Published var cachedResultCount = 0
+    @Published var imageCacheEntryCount = 0
+    @Published var imageCacheBytes = 0
+    @Published var vpnStatus = "Checking..."
+    @Published var publicIPAddress = "Checking..."
 
     private let scanner = HTTPScanner()
     private var currentTask: Task<Void, Never>?
@@ -226,10 +389,28 @@ final class ScannerViewModel: ObservableObject {
     init() {
         scanner.useTor = false
         checkTorOnLaunch()
+        refreshNetworkStatus()
     }
 
     var filteredResults: [SearchResult] {
         showHTTPOnly ? results.filter(\.isHTTPOnly) : results
+    }
+
+    var exportEntries: [ExportEntry] {
+        if searchMode == .images {
+            return imageResults.map {
+                ExportEntry(
+                    url: $0.pageURL,
+                    imageURL: $0.imageURL,
+                    title: $0.title,
+                    source: $0.pageURL.host ?? "",
+                    kind: "Image"
+                )
+            }
+        }
+        return filteredResults.map {
+            ExportEntry(url: $0.url, imageURL: nil, title: $0.title, source: $0.source, kind: "Web")
+        }
     }
 
     func checkTorOnLaunch() {
@@ -351,14 +532,36 @@ final class ScannerViewModel: ObservableObject {
 
     func clearSearchCache() {
         scanner.clearSearchCache()
+        ImageMemoryCache.shared.clear()
         refreshSearchCacheSummary()
-        statusMessage = "Search cache cleared"
+        statusMessage = "Search and image cache cleared"
     }
 
     private func refreshSearchCacheSummary() {
         let summary = scanner.searchCacheSummary()
         cacheEntryCount = summary.entries
         cachedResultCount = summary.results
+        refreshImageCacheSummary()
+    }
+
+    func refreshImageCacheSummary() {
+        let imageSummary = ImageMemoryCache.shared.summary()
+        imageCacheEntryCount = imageSummary.entries
+        imageCacheBytes = imageSummary.bytes
+    }
+
+    func refreshNetworkStatus() {
+        vpnStatus = "Checking..."
+        publicIPAddress = "Checking..."
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let vpnDetected = NetworkStatusReader.vpnOrTunnelPresent()
+            NetworkStatusReader.fetchPublicIPAddress { address in
+                DispatchQueue.main.async {
+                    self?.vpnStatus = vpnDetected ? "VPN/tunnel detected" : "No VPN/tunnel detected"
+                    self?.publicIPAddress = address ?? "Unavailable"
+                }
+            }
+        }
     }
 
     private func sourceSummary(_ results: [SearchResult]) -> String {
@@ -409,18 +612,26 @@ final class ScannerViewModel: ObservableObject {
         panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let destination = panel.url else { return }
 
-        let rows = filteredResults.map { result in
-            [result.url.absoluteString, result.title, result.source, result.url.scheme?.uppercased() ?? "-"].joined(separator: "\t")
+        let entries = exportEntries
+        let rows = entries.map { entry in
+            [
+                entry.kind,
+                entry.url.absoluteString,
+                entry.imageURL?.absoluteString ?? "",
+                entry.title,
+                entry.source,
+                entry.url.scheme?.uppercased() ?? "-"
+            ].joined(separator: "\t")
         }
         let text = ([
             "Web-Runner Results",
             "Generated: \(dateFormatter.string(from: Date()))",
             "",
-            "URL\tTitle\tSource\tProtocol"
+            "Type\tURL\tImage URL\tTitle\tSource\tProtocol"
         ] + rows).joined(separator: "\n")
         do {
             try text.write(to: destination, atomically: true, encoding: .utf8)
-            statusMessage = "Exported \(filteredResults.count) results to \(destination.lastPathComponent)"
+            statusMessage = "Exported \(entries.count) results to \(destination.lastPathComponent)"
         } catch {
             statusMessage = "Export failed: \(error.localizedDescription)"
         }
@@ -437,18 +648,25 @@ final class ScannerViewModel: ObservableObject {
         let timestamp = String(Int(Date().timeIntervalSince1970))
         var lines = [
             "<!DOCTYPE NETSCAPE-Bookmark-file-1>",
+            "<!-- This is an automatically generated file. -->",
             "<META HTTP-EQUIV=\"Content-Type\" CONTENT=\"text/html; charset=UTF-8\">",
             "<TITLE>Web-Runner Results</TITLE>",
             "<H1>Web-Runner Results</H1>",
-            "<DL><p>"
+            "<DL><p>",
+            "    <DT><H3 ADD_DATE=\"\(timestamp)\">Web-Runner Results</H3>",
+            "    <DL><p>"
         ]
-        for result in filteredResults {
-            lines.append("    <DT><A HREF=\"\(htmlEscaped(result.url.absoluteString))\" ADD_DATE=\"\(timestamp)\">\(htmlEscaped(result.title))</A>")
+        let entries = exportEntries
+        var seen = Set<String>()
+        let uniqueEntries = entries.filter { seen.insert(bookmarkKey(for: $0.url)).inserted }
+        for entry in uniqueEntries {
+            lines.append("    <DT><A HREF=\"\(htmlEscaped(entry.url.absoluteString))\" ADD_DATE=\"\(timestamp)\">\(htmlEscaped(entry.title))</A>")
         }
+        lines.append("    </DL><p>")
         lines.append("</DL><p>")
         do {
             try lines.joined(separator: "\n").write(to: destination, atomically: true, encoding: .utf8)
-            statusMessage = "Exported \(filteredResults.count) bookmarks to \(destination.lastPathComponent)"
+            statusMessage = "Exported \(uniqueEntries.count) unique bookmarks to \(destination.lastPathComponent)"
         } catch {
             statusMessage = "Bookmark export failed: \(error.localizedDescription)"
         }
@@ -460,6 +678,25 @@ final class ScannerViewModel: ObservableObject {
             .replacingOccurrences(of: "\"", with: "&quot;")
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
+    }
+
+    private func bookmarkKey(for url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return url.absoluteString.lowercased()
+        }
+        components.scheme = nil
+        components.port = nil
+        components.fragment = nil
+        if let host = components.host?.lowercased() {
+            components.host = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
+        }
+        components.path = components.path == "/" ? "" : components.path
+        let trackingNames: Set<String> = ["fbclid", "gclid", "dclid", "msclkid", "igshid", "ref", "referrer"]
+        components.queryItems = components.queryItems?.filter { item in
+            let name = item.name.lowercased()
+            return !name.hasPrefix("utm_") && !name.hasPrefix("mc_") && !name.hasPrefix("_hs") && !trackingNames.contains(name)
+        }
+        return components.string?.lowercased() ?? url.absoluteString.lowercased()
     }
 }
 
@@ -588,6 +825,9 @@ struct ContentView: View {
                 statusBar.padding(.horizontal).padding(.vertical, 8)
             }
         }
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+            vm.refreshImageCacheSummary()
+        }
     }
 
     private var sidebar: some View {
@@ -607,6 +847,9 @@ struct ContentView: View {
                 }
                 .disabled(vm.isSearching)
                 Text("Search cache: \(vm.cacheEntryCount) entries, \(vm.cachedResultCount) results (10 min)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text(String(format: "Image cache: %d items, %.1f MB", vm.imageCacheEntryCount, Double(vm.imageCacheBytes) / 1_048_576))
                     .font(.caption)
                     .foregroundColor(.secondary)
 
@@ -632,15 +875,28 @@ struct ContentView: View {
                     .disabled(vm.torStatus == "Starting...")
                 }
 
+                Divider()
+                Text("Network").font(.headline)
+                Text(vm.vpnStatus)
+                    .font(.caption)
+                    .foregroundColor(vm.vpnStatus == "No VPN/tunnel detected" ? .secondary : .green)
+                Text("Public IP: \(vm.publicIPAddress)")
+                    .font(.caption)
+                    .foregroundColor(.green)
+                Button(action: vm.refreshNetworkStatus) {
+                    Text("Refresh Network Status").frame(maxWidth: .infinity)
+                }
+                .disabled(vm.isSearching)
+
                 Spacer(minLength: 20)
                 Button(action: vm.exportResults) {
                     Text("Export Results").frame(maxWidth: .infinity)
                 }
-                .disabled(vm.filteredResults.isEmpty)
+                .disabled(vm.exportEntries.isEmpty)
                 Button(action: vm.exportBookmarks) {
                     Text("Export Bookmarks").frame(maxWidth: .infinity)
                 }
-                .disabled(vm.filteredResults.isEmpty)
+                .disabled(vm.exportEntries.isEmpty)
             }
         }
     }
